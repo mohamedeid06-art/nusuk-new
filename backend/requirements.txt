@@ -1,0 +1,5 @@
+fastapi
+uvicorn
+uiautomator2
+pydantic
+python-dotenv

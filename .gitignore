@@ -1,0 +1,30 @@
+# Dependencies & Build
+node_modules/
+dist/
+dist-ssr/
+
+# Environment & Secrets
+.env
+.env.local
+.env.*.local
+!.env.example
+
+# Runtime State, Logs & Failure Artifacts
+nusuk_state.json
+nusuk_state.json.tmp
+*.log
+fail_shots/
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+.venv/
+venv/
+ENV/
+
+# Editors & OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
