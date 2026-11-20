@@ -120,7 +120,7 @@ export default function OverviewView({
             <div>
               <p className="text-sm font-bold text-rose-200">السيرفر المحلي غير متصل حالياً</p>
               <p className="text-xs text-rose-300/80 mt-0.5">
-                شغّل <span className="font-mono">uvicorn server_merged:app</span> أو راجع عنوان السيرفر من الإعدادات.
+                شغّل <span className="font-mono">python server_pro_v2.py</span> أو راجع عنوان السيرفر من الإعدادات.
               </p>
             </div>
           </div>
@@ -141,11 +141,10 @@ export default function OverviewView({
           <div className="flex items-center justify-between">
             <span className="text-xs font-semibold text-slate-400">الدور القادم</span>
             <div
-              className={`w-9 h-9 rounded-xl flex items-center justify-center border ${
-                statusData?.next_role === 'companion'
+              className={`w-9 h-9 rounded-xl flex items-center justify-center border ${statusData?.next_role === 'companion'
                   ? 'bg-amber-500/15 border-amber-500/30 text-amber-400'
                   : 'bg-emerald-500/15 border-emerald-500/30 text-emerald-400'
-              }`}
+                }`}
             >
               <ArrowLeftRight className="w-4 h-4" />
             </div>
@@ -193,11 +192,10 @@ export default function OverviewView({
               {emu1Counter} <span className="text-sm font-semibold text-slate-400">/ {FINGERPRINT_LIMIT}</span>
             </span>
             <span
-              className={`text-[11px] font-bold px-2 py-0.5 rounded-full border ${
-                emu1Health.ok
+              className={`text-[11px] font-bold px-2 py-0.5 rounded-full border ${emu1Health.ok
                   ? 'bg-emerald-500/15 text-emerald-300 border-emerald-500/30'
                   : 'bg-rose-500/15 text-rose-300 border-rose-500/30'
-              }`}
+                }`}
             >
               {emu1Health.ok ? 'سليم' : emu1Health.reason || 'تنبيه'}
             </span>
@@ -218,11 +216,10 @@ export default function OverviewView({
               {emu2Counter} <span className="text-sm font-semibold text-slate-400">/ {FINGERPRINT_LIMIT}</span>
             </span>
             <span
-              className={`text-[11px] font-bold px-2 py-0.5 rounded-full border ${
-                emu2Health.ok
+              className={`text-[11px] font-bold px-2 py-0.5 rounded-full border ${emu2Health.ok
                   ? 'bg-emerald-500/15 text-emerald-300 border-emerald-500/30'
                   : 'bg-rose-500/15 text-rose-300 border-rose-500/30'
-              }`}
+                }`}
             >
               {emu2Health.ok ? 'سليم' : emu2Health.reason || 'تنبيه'}
             </span>
@@ -247,16 +244,14 @@ export default function OverviewView({
                 </p>
               </div>
               <span
-                className={`inline-flex items-center gap-1.5 px-3 py-1 rounded-full text-xs font-bold border ${
-                  leaderActive
+                className={`inline-flex items-center gap-1.5 px-3 py-1 rounded-full text-xs font-bold border ${leaderActive
                     ? 'bg-emerald-500/15 border-emerald-500/35 text-emerald-300'
                     : 'bg-slate-800/80 border-slate-700 text-slate-400'
-                }`}
+                  }`}
               >
                 <span
-                  className={`w-2 h-2 rounded-full ${
-                    leaderActive ? 'bg-emerald-400 animate-pulse' : 'bg-slate-500'
-                  }`}
+                  className={`w-2 h-2 rounded-full ${leaderActive ? 'bg-emerald-400 animate-pulse' : 'bg-slate-500'
+                    }`}
                 />
                 {leaderActive ? 'مجموعة نشطة' : 'لا توجد مجموعة نشطة'}
               </span>
@@ -264,20 +259,18 @@ export default function OverviewView({
 
             {/* Leader Box */}
             <div
-              className={`rounded-2xl border p-4 transition-all ${
-                leaderActive
+              className={`rounded-2xl border p-4 transition-all ${leaderActive
                   ? 'border-emerald-500/35 bg-gradient-to-l from-emerald-950/40 via-slate-950/70 to-slate-950/70'
                   : 'border-dashed border-slate-700/90 bg-slate-950/40'
-              }`}
+                }`}
             >
               <div className="flex items-center justify-between gap-3">
                 <div className="flex items-center gap-3 min-w-0">
                   <div
-                    className={`w-12 h-12 rounded-xl flex items-center justify-center shrink-0 border ${
-                      leaderActive
+                    className={`w-12 h-12 rounded-xl flex items-center justify-center shrink-0 border ${leaderActive
                         ? 'bg-emerald-500/20 border-emerald-500/40 text-emerald-300'
                         : 'bg-slate-800/70 border-slate-700 text-slate-500'
-                    }`}
+                      }`}
                   >
                     <Crown className="w-6 h-6" />
                   </div>
@@ -388,15 +381,28 @@ export default function OverviewView({
 
           {/* Quick group action buttons */}
           <div className="pt-4 border-t border-slate-800/80 flex flex-wrap items-center justify-between gap-3">
-            <button
-              type="button"
-              disabled={offline || busy || !leaderActive}
-              onClick={() => setCloseModalOpen(true)}
-              className="inline-flex items-center gap-2 px-4 py-2.5 rounded-xl text-sm font-bold bg-amber-500/15 text-amber-300 border border-amber-500/35 hover:bg-amber-500/25 transition-all disabled:opacity-45 disabled:cursor-not-allowed"
-            >
-              <LogOut className="w-4 h-4" />
-              <span>إنهاء المجموعة الحالية</span>
-            </button>
+            <div className="flex flex-wrap items-center gap-2">
+              <button
+                type="button"
+                disabled={offline || busy || !leaderActive}
+                onClick={() => setCloseModalOpen(true)}
+                className="inline-flex items-center gap-2 px-4 py-2.5 rounded-xl text-sm font-bold bg-amber-500/15 text-amber-300 border border-amber-500/35 hover:bg-amber-500/25 transition-all disabled:opacity-45 disabled:cursor-not-allowed"
+              >
+                <LogOut className="w-4 h-4" />
+                <span>إنهاء المجموعة الحالية</span>
+              </button>
+
+              {leaderActive && (
+                <button
+                  type="button"
+                  onClick={() => onNavigate('booking')}
+                  className="inline-flex items-center gap-2 px-4 py-2.5 rounded-xl text-sm font-bold bg-slate-800 hover:bg-slate-700 text-emerald-300 border border-emerald-500/30 transition-all"
+                >
+                  <Sparkles className="w-4 h-4" />
+                  <span>حجز الروضة للمجموعة</span>
+                </button>
+              )}
+            </div>
 
             <button
               type="button"
@@ -470,11 +476,10 @@ export default function OverviewView({
                     type="button"
                     disabled={offline || savingSpeed}
                     onClick={() => applySpeed(preset.value)}
-                    className={`rounded-xl py-2 px-1 text-center border transition-all disabled:opacity-50 ${
-                      active
+                    className={`rounded-xl py-2 px-1 text-center border transition-all disabled:opacity-50 ${active
                         ? 'bg-emerald-500/15 border-emerald-500/45 text-emerald-300'
                         : 'bg-slate-950/70 border-slate-800 text-slate-300 hover:border-slate-700 hover:bg-slate-800/70'
-                    }`}
+                      }`}
                   >
                     <span className="block text-xs font-mono font-bold" dir="ltr">
                       {preset.label}

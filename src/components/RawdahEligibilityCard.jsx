@@ -135,7 +135,11 @@ export default function RawdahEligibilityCard({ result, apiBaseUrl, onCopy, onOp
             <div className="rounded-lg bg-slate-900/90 border border-slate-800 px-3 py-2">
               <span className="text-slate-400 block">الحالة</span>
               <span className="font-bold text-slate-100 mt-0.5 block">
-                {details.status === 'none' ? 'لا يوجد تصريح سابق' : details.status || '—'}
+                {details.status === 'none'
+                  ? 'لا يوجد تصريح سابق'
+                  : details.status === 'skipped'
+                    ? 'تم التخطي يدوياً'
+                    : details.status || '—'}
               </span>
             </div>
             <div className="rounded-lg bg-slate-900/90 border border-slate-800 px-3 py-2">

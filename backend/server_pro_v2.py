@@ -1,0 +1,3367 @@
+import hashlib
+import urllib.error
+import urllib.request
+import base64
+import random
+import string
+import sys
+import copy
+import email
+import email.header
+import email.utils
+import imaplib
+import json
+import logging
+import os
+import re
+import subprocess
+import threading
+import time
+import xml.etree.ElementTree as ET
+from contextlib import contextmanager
+from datetime import datetime, timedelta, timezone
+from logging.handlers import RotatingFileHandler
+from typing import Dict, List, Optional, Tuple
+
+try:
+    from dotenv import load_dotenv
+    load_dotenv()
+except ImportError:
+    pass
+
+import uiautomator2 as u2
+from fastapi import FastAPI
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.staticfiles import StaticFiles
+from pydantic import BaseModel
+
+# ==========================================
+# الإعدادات العامة
+# ==========================================
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+LOG_FILE = os.path.join(BASE_DIR, "nusuk_engine.log")
+STATE_FILE = os.path.join(BASE_DIR, "nusuk_state.json")
+SHOTS_DIR = os.path.join(BASE_DIR, "fail_shots")
+BOOKING_SHOTS_DIR = os.path.join(BASE_DIR, "booking_shots")
+os.makedirs(SHOTS_DIR, exist_ok=True)
+os.makedirs(BOOKING_SHOTS_DIR, exist_ok=True)
+MAX_SHOT_FILES = 120
+
+LDPLAYER_PATH = os.getenv("LDPLAYER_PATH", r"C:\LDPlayer\LDPlayer9")
+LDCONSOLE = os.path.join(LDPLAYER_PATH, "ldconsole.exe")
+PACKAGE_NAME = os.getenv("NUSUK_PACKAGE", "com.moh.nusukapp")
+
+EMUS = {
+    "emu1": {
+        "serial": os.getenv("EMU1_SERIAL", "emulator-5596"),
+        "index": os.getenv("EMU1_INDEX", "21"),
+        "label": "المحاكي الأول (الرئيسي)",
+    },
+    "emu2": {
+        "serial": os.getenv("EMU2_SERIAL", "emulator-5594"),
+        "index": os.getenv("EMU2_INDEX", "20"),
+        "label": "المحاكي الثاني (المرافق)",
+    },
+}
+
+FINGERPRINT_EVERY = 5
+MAX_COMPANIONS = 3
+DEFAULT_PASSWORD = os.getenv("NUSUK_DEFAULT_PASSWORD", "Msamy2006**")
+LOCK_WAIT = float(os.getenv("NUSUK_LOCK_WAIT", "0"))
+HOST = os.getenv("NUSUK_HOST", "127.0.0.1")
+PORT = int(os.getenv("NUSUK_PORT", "8000"))
+
+_raw_origins = os.getenv("NUSUK_ALLOWED_ORIGINS", "*").strip()
+ALLOWED_ORIGINS = ["*"] if _raw_origins == "*" else [o.strip() for o in _raw_origins.split(",") if o.strip()]
+
+WELCOME_MARKERS = [
+    "هل أنت مستعد",
+    "تسجيل الدخول أو إنشاء حساب",
+    "متابعة كضيف",
+    "Continue as",
+    "ready to start",
+    "Login or Sign up",
+    "Log in or Sign up",
+]
+LOGIN_MARKERS = [
+    "هل أنت مستعد",
+    "تسجيل الدخول أو إنشاء حساب",
+    "تسجيل الدخول للمتابعة",
+    "أنشئ حسابًا جديدًا",
+    "أنشئ حسابك",
+    "Create",
+    "Sign up",
+    "Register",
+    "تسجيل الدخول",
+    "Login",
+    "Log in",
+]
+CREATE_MARKERS = ["أنشئ حسابًا جديدًا", "أنشئ حسابك", "Create", "Sign up", "Register"]
+ALREADY_KEYS = [
+    "مسجل مسبق", "مسجّل مسبق", "مسجل باسم حساب", "مسجّل باسم حساب",
+    "سجل الخروج واستعد حسابك", "سجّل الخروج واستعد حسابك", "استعد حسابك",
+    "رقم الهوية مسجل", "رقم الهوية مسجّل", "مرتبط بحساب آخر",
+    "مسجل بالفعل", "موجود مسبق", "مسجلة مسبق", "لديك حساب",
+    "already registered", "already exists", "account already",
+]
+SUCCESS_KEYS = ["exploring", "استكشاف", "نجاح"]
+EMAIL_RE = re.compile(r"[^@\s]+@[^@\s]+\.[^@\s]+")
+ARABIC_DIACRITICS_RE = re.compile(r"[\u064B-\u065F\u0670]")
+
+
+def strip_arabic_diacritics(text: str) -> str:
+    return ARABIC_DIACRITICS_RE.sub("", text or "")
+
+# ==========================================
+# Logging
+# ==========================================
+def setup_logging() -> logging.Logger:
+    logger = logging.getLogger("nusuk")
+    if logger.handlers:
+        return logger
+    logger.setLevel(logging.INFO)
+    fmt = logging.Formatter("%(asctime)s | %(levelname)-7s | %(message)s", "%Y-%m-%d %H:%M:%S")
+    fh = RotatingFileHandler(LOG_FILE, maxBytes=5 * 1024 * 1024, backupCount=3, encoding="utf-8")
+    fh.setFormatter(fmt)
+    ch = logging.StreamHandler()
+    ch.setFormatter(fmt)
+    logger.addHandler(fh)
+    logger.addHandler(ch)
+    logger.propagate = False
+    return logger
+
+
+log = setup_logging()
+
+# ==========================================
+# الحالة المحفوظة
+# ==========================================
+_state_lock = threading.RLock()
+
+
+def _default_group() -> dict:
+    return {"leader_active": False, "leader_name": None, "leader_id": None, "companions": []}
+
+
+def _default_state() -> dict:
+    return {
+        "counters": {"emu1": 0, "emu2": 0},
+        "group": _default_group(),
+        "health": {"emu1": {"ok": True, "reason": ""}, "emu2": {"ok": True, "reason": ""}},
+        "speed_multiplier": 1.0,
+    }
+
+
+def load_state() -> dict:
+    st = _default_state()
+    try:
+        with open(STATE_FILE, "r", encoding="utf-8") as f:
+            saved = json.load(f)
+        for k in st["counters"]:
+            st["counters"][k] = int(saved.get("counters", {}).get(k, 0))
+        g = saved.get("group", {})
+        for k in st["group"]:
+            if k in g:
+                st["group"][k] = g[k]
+        for k in st["health"]:
+            h = saved.get("health", {}).get(k)
+            if isinstance(h, dict):
+                st["health"][k] = {"ok": bool(h.get("ok", True)), "reason": str(h.get("reason", ""))}
+        if "speed_multiplier" in saved:
+            st["speed_multiplier"] = float(saved["speed_multiplier"])
+        log.info("تم تحميل الحالة المحفوظة من %s", STATE_FILE)
+    except FileNotFoundError:
+        pass
+    except Exception as e:
+        log.warning("تعذر قراءة ملف الحالة (%s) - البدء بحالة جديدة", e)
+    return st
+
+
+STATE = load_state()
+
+
+def save_state():
+    with _state_lock:
+        tmp = STATE_FILE + ".tmp"
+        try:
+            with open(tmp, "w", encoding="utf-8") as f:
+                json.dump(STATE, f, ensure_ascii=False, indent=2)
+            os.replace(tmp, STATE_FILE)
+        except Exception as e:
+            log.error("فشل حفظ الحالة: %s", e)
+
+
+def reset_group():
+    with _state_lock:
+        STATE["group"] = _default_group()
+    save_state()
+
+
+def set_health(emu_key: str, ok: bool, reason: str = ""):
+    with _state_lock:
+        STATE["health"][emu_key] = {"ok": ok, "reason": reason}
+    save_state()
+
+
+# ==========================================
+# الاتصال بالمحاكيات + أدوات مقاومة اللاج
+# ==========================================
+OP_LOCK = threading.Lock()
+
+
+@contextmanager
+def exclusive(wait: float = 0.0):
+    got = OP_LOCK.acquire(timeout=wait) if wait > 0 else OP_LOCK.acquire(blocking=False)
+    try:
+        yield got
+    finally:
+        if got:
+            OP_LOCK.release()
+
+
+class FlowError(Exception):
+    pass
+
+
+_devices_cache = {}
+
+
+def get_device(serial: str, timeout: int = 120):
+    if serial in _devices_cache:
+        try:
+            if _devices_cache[serial].info.get("screenOn") is not None:
+                return _devices_cache[serial]
+        except Exception:
+            _devices_cache.pop(serial, None)
+
+    start_t = time.time()
+    while time.time() - start_t < timeout:
+        try:
+            dev = u2.connect(serial)
+            if dev.info.get("screenOn") is not None:
+                _devices_cache[serial] = dev
+                return dev
+        except Exception:
+            pass
+        time.sleep(1.5)
+    raise RuntimeError(f"تعذر الاتصال بالمحاكي {serial}")
+
+
+def smart_sleep(base_seconds: float, mult: float = 1.0):
+    time.sleep(max(0.1, base_seconds * mult))
+
+
+def wait_for_network_loading(dev, max_wait: float = 12.0) -> bool:
+    start_t = time.time()
+    time.sleep(0.25)
+    while time.time() - start_t < max_wait:
+        try:
+            xml_str = dev.dump_hierarchy()
+            is_loading = (
+                "ProgressBar" in xml_str
+                or "جاري التحميل" in xml_str
+                or "يرجى الانتظار" in xml_str
+                or "Loading" in xml_str
+                or "Please wait" in xml_str
+            )
+            if not is_loading:
+                return True
+        except Exception:
+            pass
+        time.sleep(0.6)
+    return False
+
+
+def wait_edits(dev, min_count: int, timeout: float = 7.0, interval: float = 0.25):
+    end = time.time() + timeout
+    while True:
+        edits = dev(className="android.widget.EditText")
+        if len(edits) >= min_count:
+            return edits
+        if time.time() >= end:
+            return None
+        time.sleep(interval)
+
+
+def wait_app_foreground(dev, package: str, timeout: float) -> bool:
+    end = time.time() + timeout
+    while time.time() < end:
+        try:
+            if dev.app_current().get("package") == package:
+                return True
+        except Exception:
+            pass
+        time.sleep(0.5)
+    return False
+
+
+# ==========================================
+# قواميس تحويل الجنسيات
+# ==========================================
+NAT_TO_ENGLISH = {
+    "تايلاند": "Thailand", "مصر": "Egypt", "المغرب": "Morocco", "الجزائر": "Algeria",
+    "تونس": "Tunisia", "الأردن": "Jordan", "الاردن": "Jordan", "العراق": "Iraq",
+    "السودان": "Sudan", "اليمن": "Yemen", "لبنان": "Lebanon", "سوريا": "Syria",
+    "فلسطين": "Palestine", "الكويت": "Kuwait", "الإمارات": "United Arab Emirates",
+    "الامارات": "United Arab Emirates", "قطر": "Qatar", "البحرين": "Bahrain",
+    "عمان": "Oman", "تركيا": "Turkey", "باكستان": "Pakistan", "الهند": "India",
+    "بنغلاديش": "Bangladesh", "بنجلاديش": "Bangladesh", "إندونيسيا": "Indonesia",
+    "اندونيسيا": "Indonesia", "ماليزيا": "Malaysia", "بريطانيا": "United Kingdom",
+    "فرنسا": "France", "ألمانيا": "Germany", "المانيا": "Germany",
+    "أمريكا": "United States", "امريكا": "United States",
+}
+
+NAT_TO_ARABIC = {
+    "thailand": "تايلاند", "egypt": "مصر", "morocco": "المغرب", "algeria": "الجزائر",
+    "tunisia": "تونس", "jordan": "الأردن", "iraq": "العراق", "sudan": "السودان",
+    "yemen": "اليمن", "lebanon": "لبنان", "syria": "سوريا", "palestine": "فلسطين",
+    "kuwait": "الكويت", "united arab emirates": "الإمارات", "qatar": "قطر",
+    "bahrain": "البحرين", "oman": "عمان", "turkey": "تركيا", "pakistan": "باكستان",
+    "india": "الهند", "bangladesh": "بنغلاديش", "indonesia": "إندونيسيا",
+    "malaysia": "ماليزيا", "united kingdom": "بريطانيا", "france": "فرنسا",
+    "germany": "ألمانيا", "united states": "أمريكا",
+}
+
+
+def get_both_nat_versions(raw_nat: str, default_y: int):
+    clean = raw_nat.strip()
+    ar_ver = NAT_TO_ARABIC.get(clean.lower(), clean)
+    en_ver = NAT_TO_ENGLISH.get(clean, clean)
+
+    if clean in NAT_TO_ENGLISH:
+        ar_ver = clean
+        en_ver = NAT_TO_ENGLISH[clean]
+    elif clean.lower() in NAT_TO_ARABIC:
+        ar_ver = NAT_TO_ARABIC[clean.lower()]
+        en_ver = clean
+
+    final_y = 275 if (ar_ver == "مصر" or en_ver.lower() == "egypt") else default_y
+    return ar_ver, en_ver, final_y
+
+
+def visible_text_without_inputs(xml_str: str) -> str:
+    try:
+        root = ET.fromstring(xml_str.encode("utf-8"))
+    except Exception:
+        return xml_str.lower()
+    parts = []
+    for node in root.iter():
+        if node.attrib.get("class") == "android.widget.EditText":
+            continue
+        t = node.attrib.get("text") or ""
+        d = node.attrib.get("content-desc") or ""
+        if t:
+            parts.append(t)
+        if d:
+            parts.append(d)
+    return " ".join(parts).lower()
+
+
+def smart_search_nationality(dev, raw_nat: str, default_y: int, mult: float = 1.0):
+    ar_ver, en_ver, final_y = get_both_nat_versions(raw_nat, default_y)
+    dump_xml = dev.dump_hierarchy()
+    visible_init = visible_text_without_inputs(dump_xml)
+    if any(eng_c in visible_init for eng_c in ("afghanistan", "albania", "algeria", "bahrain")):
+        is_arabic_screen = False
+    elif any(ar_c in visible_init for ar_c in ("أفغانستان", "افغانستان", "ألبانيا", "الجزائر", "البحرين")):
+        is_arabic_screen = True
+    else:
+        is_arabic_screen = bool(re.search(r"[\u0600-\u06FF]", visible_init))
+
+    first_try = ar_ver if is_arabic_screen else en_ver
+    second_try = en_ver if is_arabic_screen else ar_ver
+
+    target_box = None
+    try:
+        edits = dev(className="android.widget.EditText")
+        if len(edits) > 0:
+            target_box = min(edits, key=lambda el: el.info.get("bounds", {}).get("top", 9999))
+            target_box.click()
+        else:
+            dev.click(540, 115)
+    except Exception:
+        target_box = None
+        dev.click(540, 115)
+
+    smart_sleep(0.25, mult)
+    wrote = False
+    if target_box is not None:
+        try:
+            target_box.set_text(first_try)
+            wrote = True
+        except Exception:
+            wrote = False
+    if not wrote:
+        dev.click(540, 115)
+        smart_sleep(0.15, mult)
+        dev.send_keys(first_try, clear=True)
+
+    smart_sleep(0.65, mult)
+    after_dump = dev.dump_hierarchy()
+    visible = visible_text_without_inputs(after_dump)
+    no_result_keywords = ["no result", "not found", "no data", "لا توجد", "لا يوجد", "غير موجود"]
+
+    need_fallback = any(k in visible for k in no_result_keywords) or (first_try[:3].lower() not in visible)
+
+    if need_fallback and first_try != second_try:
+        log.info(f"تبديل فوري للجنسية إلى ({second_try})")
+        wrote2 = False
+        if target_box is not None:
+            try:
+                target_box.set_text(second_try)
+                wrote2 = True
+            except Exception:
+                wrote2 = False
+        if not wrote2:
+            dev.click(540, 115)
+            smart_sleep(0.15, mult)
+            dev.send_keys(second_try, clear=True)
+        smart_sleep(0.65, mult)
+
+    return final_y
+
+
+# ==========================================
+# دالة الريستارت وفتح التطبيق
+# ==========================================
+def restart_and_randomize_ldplayer(emu_key: str) -> bool:
+    emu = EMUS[emu_key]
+    emu_index = emu["index"]
+    emu_serial = emu["serial"]
+    emu_name = emu["label"]
+
+    log.info("#" * 60)
+    log.info(f"[*] تغيير البصمة وإعادة التشغيل لـ {emu_name} (Index: {emu_index})...")
+    log.info("#" * 60)
+
+    _devices_cache.pop(emu_serial, None)
+
+    try:
+        subprocess.run([
+            LDCONSOLE, "modify", "--index", emu_index,
+            "--androidid", "auto", "--mac", "auto", "--imei", "auto"
+        ], check=True)
+        log.info(f"[✓] تم تحديث معرّفات {emu_name} بنجاح.")
+
+        subprocess.run([LDCONSOLE, "reboot", "--index", emu_index], check=True)
+        log.info(f"[*] إرسال أمر ريستارت لـ {emu_name}.. في انتظار الإقلاع...")
+
+        time.sleep(15)
+        dev = get_device(emu_serial, timeout=180)
+        time.sleep(5)
+
+        subprocess.run([LDCONSOLE, "runapp", "--index", emu_index, "--packagename", PACKAGE_NAME])
+        time.sleep(2)
+
+        nusuk_icon = dev(text="Nusuk")
+        if not nusuk_icon.exists:
+            nusuk_icon = dev(text="نسك")
+
+        if nusuk_icon.exists:
+            nusuk_icon.click()
+        else:
+            dev.click(694, 280)
+
+        time.sleep(10)
+        pass_welcome_screen_if_needed(dev)
+        set_health(emu_key, True, "")
+        log.info(f"[✓] التطبيق مفتوح وجاهز على {emu_name}!")
+        return True
+
+    except Exception as e:
+        log.error(f"[X] خطأ أثناء تدوير بصمة {emu_name}: {e}")
+        set_health(emu_key, False, "restart_failed")
+        return False
+
+
+def bump_counter(emu_key: str):
+    with _state_lock:
+        STATE["counters"][emu_key] += 1
+        n = STATE["counters"][emu_key]
+    save_state()
+    log.info(f"عداد بصمة {EMUS[emu_key]['label']}: {n}/{FINGERPRINT_EVERY}")
+    if n >= FINGERPRINT_EVERY:
+        if restart_and_randomize_ldplayer(emu_key):
+            with _state_lock:
+                STATE["counters"][emu_key] = 0
+            save_state()
+
+
+# ==========================================
+# قراءة OTP من Gmail
+# ==========================================
+MONTHS = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"]
+AR_MONTHS = {
+    "يناير": 1, "فبراير": 2, "مارس": 3, "أبريل": 4, "ابريل": 4, "مايو": 5, "يونيو": 6,
+    "يوليو": 7, "أغسطس": 8, "اغسطس": 8, "سبتمبر": 9, "أكتوبر": 10, "اكتوبر": 10, "نوفمبر": 11, "ديسمبر": 12
+}
+OTP_KEYWORDS = ["nusuk", "نسك", "verification", "رمز", "otp"]
+_used_otp_ids = set()
+
+
+def _imap_date(dt: datetime) -> str:
+    return f"{dt.day:02d}-{MONTHS[dt.month - 1]}-{dt.year}"
+
+
+def _html_to_text(html: str) -> str:
+    html = re.sub(r"(?is)<(script|style).*?>.*?</\1>", " ", html)
+    return re.sub(r"(?s)<[^>]+>", " ", html)
+
+
+def message_text(msg) -> str:
+    texts = []
+    parts = msg.walk() if msg.is_multipart() else [msg]
+    for part in parts:
+        ctype = part.get_content_type()
+        if ctype not in ("text/plain", "text/html"):
+            continue
+        payload = part.get_payload(decode=True)
+        if payload is None:
+            continue
+        charset = part.get_content_charset() or "utf-8"
+        try:
+            text = payload.decode(charset, errors="ignore")
+        except LookupError:
+            text = payload.decode("utf-8", errors="ignore")
+        if ctype == "text/html":
+            text = _html_to_text(text)
+        texts.append(text)
+    return "\n".join(texts)
+
+
+def _decode_header(raw) -> str:
+    try:
+        return str(email.header.make_header(email.header.decode_header(raw or "")))
+    except Exception:
+        return str(raw or "")
+
+
+def _msg_timestamp(msg) -> Optional[float]:
+    try:
+        dt = email.utils.parsedate_to_datetime(msg.get("Date"))
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return dt.timestamp()
+    except Exception:
+        return None
+
+
+def _open_imap(user: str, password: str):
+    try:
+        mail = imaplib.IMAP4_SSL("imap.gmail.com", timeout=15)
+    except TypeError:
+        mail = imaplib.IMAP4_SSL("imap.gmail.com")
+    mail.login(user, password)
+    return mail
+
+
+def fetch_nusuk_otp(client_email: str, client_pass: str, timeout: int = 55, sent_after: Optional[float] = None) -> Optional[str]:
+    log.info(f"مراقبة كود OTP على: {client_email}...")
+    start_time = time.time()
+    min_ts = (sent_after - 15) if sent_after is not None else (start_time - 45)
+    clean_pass = client_pass.replace(" ", "")
+    year_str = str(datetime.now().year)
+    checked = set()
+    mail = None
+    last_err_text = None
+
+    if len(_used_otp_ids) > 200:
+        _used_otp_ids.clear()
+
+    try:
+        while time.time() - start_time < timeout:
+            try:
+                if mail is None:
+                    mail = _open_imap(client_email, clean_pass)
+                mail.select("inbox")
+                since = _imap_date(datetime.now(timezone.utc) - timedelta(days=1))
+                status, messages = mail.search(None, "SINCE", since)
+                ids = messages[0].split() if status == "OK" and messages and messages[0] else []
+
+                for mid in reversed(ids[-15:]):
+                    status, data = mail.fetch(mid, "(BODY.PEEK[HEADER.FIELDS (FROM SUBJECT DATE MESSAGE-ID)])")
+                    if status != "OK" or not data or not isinstance(data[0], tuple):
+                        continue
+                    head = email.message_from_bytes(data[0][1])
+                    msgid = (head.get("Message-ID") or "").strip() or mid.decode(errors="ignore")
+                    key = f"{client_email}|{msgid}"
+                    if key in checked or key in _used_otp_ids:
+                        continue
+                    ts = _msg_timestamp(head)
+                    if ts is not None and ts < min_ts:
+                        checked.add(key)
+                        continue
+
+                    status, data = mail.fetch(mid, "(BODY.PEEK[])")
+                    if status != "OK" or not data or not isinstance(data[0], tuple):
+                        continue
+                    msg = email.message_from_bytes(data[0][1])
+                    sender = (msg.get("From") or "").lower()
+                    subject = _decode_header(msg.get("Subject")).lower()
+                    body = message_text(msg)
+
+                    if any(k in sender or k in subject or k in body.lower() for k in OTP_KEYWORDS):
+                        codes = [c for c in re.findall(r"\b\d{4}\b", body) if c != year_str]
+                        if codes:
+                            otp = codes[0]
+                            mail.store(mid, "+FLAGS", "\\Seen")
+                            _used_otp_ids.add(key)
+                            log.info(f"[✓] تم التقاط OTP: {otp}")
+                            return otp
+                    checked.add(key)
+
+            except imaplib.IMAP4.error as e:
+                text = str(e)
+                if "AUTHENTICATIONFAILED" in text.upper() or "invalid credentials" in text.lower():
+                    raise FlowError("فشل الدخول لإيميل الـ OTP - تأكد من الإيميل وكلمة App Password")
+                if text != last_err_text:
+                    log.warning(f"خطأ IMAP: {text}")
+                    last_err_text = text
+                mail = None
+            except FlowError:
+                raise
+            except Exception as e:
+                text = f"{type(e).__name__}: {e}"
+                if text != last_err_text:
+                    log.warning(f"خطأ أثناء قراءة البريد: {text}")
+                    last_err_text = text
+                mail = None
+
+            time.sleep(1.0)
+    finally:
+        if mail is not None:
+            try:
+                mail.logout()
+            except Exception:
+                pass
+    return None
+
+
+# ==========================================
+# تسجيل الخروج + الدرع الذاتي لمنع التخريف المتسلسل
+# ==========================================
+def perform_safe_logout(dev, slow: bool = True):
+    log.info("سحب القائمة لأسفل لتسجيل الخروج...")
+    time.sleep(1.2)
+    dev.swipe(0.5, 0.85, 0.5, 0.15, steps=25)
+    time.sleep(1.0)
+    dev.swipe(0.5, 0.85, 0.5, 0.15, steps=25)
+    time.sleep(1.2)
+
+    log.info("النقر على تسجيل الخروج (540, 1730)...")
+    dev.click(540, 1730)
+    time.sleep(1.5)
+
+    clicked_confirm = False
+    for _ in range(3):
+        for txt in ["نعم", "تأكيد", "ديكأت", "موافق", "Yes", "Confirm", "Logout", "Log out"]:
+            btn_confirm = dev(textContains=txt)
+            if btn_confirm.exists:
+                btn_confirm.click()
+                clicked_confirm = True
+                break
+        if clicked_confirm:
+            break
+        time.sleep(0.5)
+
+    if not clicked_confirm:
+        dev.click(540, 1150)
+
+    time.sleep(3.0)
+    wait_for_network_loading(dev, max_wait=6.0)
+
+
+def pass_welcome_screen_if_needed(dev, mult: float = 1.0) -> bool:
+    """تخطي الشاشة الترحيبية (هل أنت مستعد لبدء رحلتك؟ -> تسجيل الدخول أو إنشاء حساب) إن وُجدت"""
+    try:
+        dump = dev.dump_hierarchy()
+        if "تسجيل الدخول للمتابعة" in dump or "أنشئ حسابًا جديدًا" in dump:
+            return True
+        if any(m in dump for m in WELCOME_MARKERS):
+            log.info("تخطي شاشة البداية الترحيبية (تسجيل الدخول أو إنشاء حساب)...")
+            btn = dev(textContains="تسجيل الدخول أو إنشاء حساب")
+            if not btn.exists:
+                btn = dev(textContains="Login or Sign up")
+            if not btn.exists:
+                btn = dev(textContains="Log in or Sign up")
+            if btn.exists:
+                btn.click()
+            else:
+                dev.click(540, 1768)
+            smart_sleep(1.2, mult)
+            wait_for_network_loading(dev, max_wait=6.0)
+            return True
+    except Exception:
+        pass
+    return False
+
+
+def open_registration_form(dev, mult: float = 1.0):
+    """يضمن الوصول لشاشة إنشاء الحساب (الـ 3 خانات) سواء من الشاشة الترحيبية أو النافذة السفلية المنبثقة"""
+    for _ in range(3):
+        edits = dev(className="android.widget.EditText")
+        if len(edits) >= 3:
+            return edits
+
+        dump = dev.dump_hierarchy()
+
+        # لو دخل بالخطأ على شاشة تسجيل الدخول بالبريد (خانتين فقط)، نرجع بالسهم العلوي (1019, 91)
+        if len(edits) == 2 or "مرحبًا بعودتك" in dump or "تسجيل الدخول إلى حسابك" in dump:
+            dev.click(1019, 91)
+            smart_sleep(1.0, mult)
+            dump = dev.dump_hierarchy()
+
+        # 1. لو على الشاشة الترحيبية ("هل أنت مستعد لبدء رحلتك؟") نضغط الزر الأسود (540, 1768)
+        if ("تسجيل الدخول للمتابعة" not in dump and "أنشئ حسابًا جديدًا" not in dump) and any(
+            m in dump for m in WELCOME_MARKERS
+        ):
+            log.info("الضغط على الزر الأسود (تسجيل الدخول أو إنشاء حساب)...")
+            btn_w = dev(textContains="تسجيل الدخول أو إنشاء حساب")
+            if btn_w.exists:
+                btn_w.click()
+            else:
+                dev.click(540, 1768)
+            smart_sleep(1.2, mult)
+            dump = dev.dump_hierarchy()
+
+        # 2. الآن على النافذة المنبثقة ("تسجيل الدخول للمتابعة") -> نضغط "أنشئ حسابًا جديدًا" (540, 1704)
+        clicked = False
+        for txt in CREATE_MARKERS:
+            if txt in dump:
+                btn = dev(textContains=txt)
+                if not btn.exists:
+                    btn = dev(descriptionContains=txt)
+                if btn.exists:
+                    btn[-1].click()
+                    clicked = True
+                    break
+
+        if not clicked:
+            dev.click(540, 1704)
+
+        inputs = wait_edits(dev, 3, timeout=4.5 * mult)
+        if inputs is not None:
+            return inputs
+    return None
+
+
+def on_login_screen(dev) -> bool:
+    try:
+        if dev.app_current().get("package") != PACKAGE_NAME:
+            return False
+        dump = dev.dump_hierarchy()
+        return any(t in dump for t in LOGIN_MARKERS) or len(dev(className="android.widget.EditText")) >= 3
+    except Exception:
+        return False
+
+
+def _wait_login_screen(dev, timeout: float) -> bool:
+    end = time.time() + timeout
+    while time.time() < end:
+        if on_login_screen(dev):
+            return True
+        time.sleep(0.6)
+    return False
+
+
+def force_clean_login_state(dev, emu_key: str) -> bool:
+    label = EMUS[emu_key]["label"]
+    idx = EMUS[emu_key]["index"]
+
+    try:
+        if on_login_screen(dev):
+            return True
+    except Exception:
+        pass
+
+    log.warning(f"🛡️ [{label}] الشاشة ليست على نقطة البداية! جاري التنظيف الذاتي قبل البدء...")
+
+    try:
+        dev.app_stop(PACKAGE_NAME)
+        time.sleep(1.0)
+        subprocess.run([LDCONSOLE, "runapp", "--index", idx, "--packagename", PACKAGE_NAME])
+        time.sleep(2.0)
+        if not wait_app_foreground(dev, PACKAGE_NAME, 4.0):
+            nusuk_icon = dev(text="Nusuk")
+            if not nusuk_icon.exists:
+                nusuk_icon = dev(text="نسك")
+            if nusuk_icon.exists:
+                nusuk_icon.click()
+            else:
+                dev.click(694, 280)
+        time.sleep(6.0)
+        wait_for_network_loading(dev, max_wait=8.0)
+    except Exception as e:
+        log.warning(f"خطأ أثناء إعادة فتح التطبيق: {e}")
+
+    if _wait_login_screen(dev, timeout=5.0):
+        log.info(f"[✓] [{label}] تم استعادة شاشة الدخول بنجاح!")
+        return True
+
+    log.warning(f"[{label}] يوجد حساب سابق عالق بالداخل.. جاري إخراجه إجبارياً...")
+    try:
+        for _ in range(3):
+            dev.click(1000, 100)
+            time.sleep(0.25)
+        dev.click(52, 103)
+        time.sleep(0.6)
+        dev.click(1019, 91)
+        time.sleep(0.8)
+        dev.click(65, 101)
+        time.sleep(1.8)
+        perform_safe_logout(dev, slow=True)
+    except Exception:
+        pass
+
+    if _wait_login_screen(dev, timeout=6.0):
+        log.info(f"[✓] [{label}] تم إخراج الحساب العالق والعودة لشاشة الدخول!")
+        return True
+
+    log.error(f"[{label}] تعذر الوصول لشاشة الدخول بعد التنظيف الذاتي")
+    return False
+
+
+def reopen_nusuk_app(dev, emu_key: str, mult: float = 1.0) -> bool:
+    """إغلاق تطبيق نسك وإعادة فتحه للوصول النظيف للشاشة الرئيسية بدون لخبطة في التنقل"""
+    label = EMUS[emu_key]["label"]
+    idx = EMUS[emu_key]["index"]
+    log.info(f"🔄 [{label}] إعادة تشغيل تطبيق نسك للرجوع للشاشة الرئيسية النظيفة...")
+    try:
+        dev.app_stop(PACKAGE_NAME)
+        time.sleep(1.0)
+        subprocess.run([LDCONSOLE, "runapp", "--index", idx, "--packagename", PACKAGE_NAME])
+        time.sleep(2.0)
+        if not wait_app_foreground(dev, PACKAGE_NAME, 4.0):
+            nusuk_icon = dev(text="Nusuk")
+            if not nusuk_icon.exists:
+                nusuk_icon = dev(text="نسك")
+            if nusuk_icon.exists:
+                nusuk_icon.click()
+            else:
+                dev.click(694, 280)
+        time.sleep(5.0 * mult)
+        wait_for_network_loading(dev, max_wait=8.0)
+        pass_welcome_screen_if_needed(dev, mult=mult)
+        smart_sleep(1.5, mult)
+
+        # التأكد من اختفاء أي نوافذ وظهور الشاشة الرئيسية
+        for _ in range(10):
+            dump = dev.dump_hierarchy()
+            if any(h in dump for h in ("المحفظة", "العمرة", "الروضة", "نسك AI", "حجز تصريح")):
+                log.info(f"[✓] [{label}] تم فتح تطبيق نسك والوصول للشاشة الرئيسية بنجاح!")
+                return True
+            if any(m in dump for m in WELCOME_MARKERS):
+                pass_welcome_screen_if_needed(dev, mult=mult)
+            if "تابع واستكشف" in dump or "استكشف" in dump:
+                click_text_in_xml(dev, dump, ("تابع واستكشف", "استكشف", "تابع"), min_y=1600, max_y=1900)
+            time.sleep(0.8)
+        return True
+    except Exception as e:
+        log.warning(f"خطأ أثناء إعادة تشغيل تطبيق نسك: {e}")
+        return False
+
+
+def save_failure_artifacts(dev, tag: str) -> Optional[str]:
+    if dev is None:
+        return None
+    try:
+        os.makedirs(SHOTS_DIR, exist_ok=True)
+        fname = f"{datetime.now().strftime('%Y%m%d_%H%M%S')}_{tag}"
+        base = os.path.join(SHOTS_DIR, fname)
+        dev.screenshot(base + ".png")
+        try:
+            with open(base + ".xml", "w", encoding="utf-8") as f:
+                f.write(dev.dump_hierarchy())
+        except Exception:
+            pass
+        files = sorted(
+            (os.path.join(SHOTS_DIR, n) for n in os.listdir(SHOTS_DIR)),
+            key=os.path.getmtime,
+        )
+        for old in files[:-MAX_SHOT_FILES]:
+            try:
+                os.remove(old)
+            except Exception:
+                pass
+        return f"/fail_shots/{fname}.png"
+    except Exception as e:
+        log.warning(f"تعذر حفظ لقطة الفشل: {e}")
+        return None
+
+
+# ==========================================
+# استخراج بيانات الملف الشخصي + إدارة صفحة الأصدقاء
+# ==========================================
+def click_text_in_xml(dev, xml_str: str, targets: tuple, min_y: int = 0, max_y: int = 1920) -> bool:
+    """البحث عن نص داخل XML الملتقط (مع تجاهل التشكيل والشدّة) والضغط على مركز العنصر فوراً بدون استدعاءات RPC إضافية"""
+    try:
+        root = ET.fromstring(xml_str.encode("utf-8"))
+        lowered_targets = [strip_arabic_diacritics(t).lower() for t in targets]
+        for node in root.iter():
+            t = strip_arabic_diacritics(node.attrib.get("text") or "").strip().lower()
+            d = strip_arabic_diacritics(node.attrib.get("content-desc") or "").strip().lower()
+            if not t and not d:
+                continue
+            if any(lt in t or lt in d for lt in lowered_targets):
+                bounds = node.attrib.get("bounds") or ""
+                bm = re.match(r"\[(\d+),(\d+)\]\[(\d+),(\d+)\]", bounds)
+                if bm:
+                    x1, y1, x2, y2 = map(int, bm.groups())
+                    cy = (y1 + y2) // 2
+                    if min_y <= cy <= max_y:
+                        cx = (x1 + x2) // 2
+                        dev.click(cx, cy)
+                        return True
+    except Exception:
+        pass
+    return False
+
+
+def is_on_friends_show_all_page(xml_str: str) -> bool:
+    """التحقق الصارم أن الشاشة داخل صفحة الأصدقاء (Show All) وليست على صفحة البروفايل الخارجية"""
+    profile_only_markers = (
+        "عرض الكل", "Show All", "Show all", "بطاقاتي", "My Cards",
+        "البطاقات والتصاريح", "التصاريح السارية", "Active Permits", "الحجوزات",
+    )
+    if any(pm in xml_str for pm in profile_only_markers):
+        return False
+    show_all_markers = (
+        "جميع الأصدقاء", "All Friends", "المفضلة", "Favorites",
+        "اضف للمفضلة", "إدارة علاقاتك", "Manage your",
+    )
+    return any(sm in xml_str for sm in show_all_markers)
+
+
+def get_add_friend_input_box(dev):
+    """إرجاع مربع إدخال Nusuk ID في نافذة إضافة صديق (top > 200 لتجاهل مربع البحث العلوي في صفحة الأصدقاء)"""
+    try:
+        for el in dev(className="android.widget.EditText"):
+            top = el.info.get("bounds", {}).get("top", 0)
+            if top > 200:
+                return el
+    except Exception:
+        pass
+    return None
+
+
+def is_add_friend_dialog_open(dev) -> bool:
+    return get_add_friend_input_box(dev) is not None
+
+
+def wait_add_friend_dialog(dev, timeout: float):
+    end_t = time.time() + timeout
+    while time.time() < end_t:
+        box = get_add_friend_input_box(dev)
+        if box is not None:
+            return box
+        time.sleep(0.25)
+    return None
+
+
+def ensure_leader_on_friends_page(dev1, mult: float = 1.0) -> bool:
+    """ضمان وجود المحاكي الأول داخل صفحة الأصدقاء (Show All) وإعادته إليها تلقائياً لو خرج منها لأي سبب"""
+    for attempt in range(3):
+        if is_add_friend_dialog_open(dev1):
+            dev1.press("back")
+            smart_sleep(1.0, mult)
+
+        dump1 = dev1.dump_hierarchy()
+        if is_on_friends_show_all_page(dump1):
+            return True
+
+        if attempt > 0:
+            log.warning(f"🛡️ المحاكي الأول ليس في صفحة الأصدقاء (محاولة {attempt + 1}/3) - جاري فتح Show All...")
+        else:
+            log.info("فتح/استعادة صفحة الأصدقاء (Show All) في المحاكي الأول...")
+
+        profile_markers = (
+            "عرض الكل", "Show All", "Show all", "بطاقاتي", "My Cards",
+            "العائلة والأصدقاء", "Family & Friends", "البطاقات والتصاريح",
+        )
+        leader_id_val = (STATE.get("group") or {}).get("leader_id") or ""
+        if any(m in dump1 for m in profile_markers) or (leader_id_val and leader_id_val in dump1):
+            if not click_text_in_xml(dev1, dump1, ("عرض الكل", "Show All", "Show all"), min_y=700, max_y=1300):
+                dev1.click(140, 1025)
+            smart_sleep(1.3, mult)
+            wait_for_network_loading(dev1, max_wait=6.0)
+        elif any(m in dump1 for m in ("التصاريح", "Permits", "أكمل", "نوع الهوية")):
+            dev1.click(1019, 91)
+            smart_sleep(1.3, mult)
+            wait_for_network_loading(dev1, max_wait=6.0)
+            dump_prof = dev1.dump_hierarchy()
+            if not click_text_in_xml(dev1, dump_prof, ("عرض الكل", "Show All", "Show all"), min_y=700, max_y=1300):
+                dev1.click(140, 1025)
+            smart_sleep(1.3, mult)
+        else:
+            dev1.click(65, 101)
+            smart_sleep(1.5, mult)
+            wait_for_network_loading(dev1, max_wait=6.0)
+            dump_prof = dev1.dump_hierarchy()
+            if not click_text_in_xml(dev1, dump_prof, ("عرض الكل", "Show All", "Show all"), min_y=700, max_y=1300):
+                dev1.click(140, 1025)
+            smart_sleep(1.3, mult)
+
+    return is_on_friends_show_all_page(dev1.dump_hierarchy())
+
+
+def _click_add_friend_on_show_all(dev1, comp_num: int, mult: float = 1.0):
+    add_labels = ("أضف صديق", "إضافة صديق", "اضف صديق", "Add friend", "Add Friend")
+    dump1 = dev1.dump_hierarchy()
+    if click_text_in_xml(dev1, dump1, add_labels, min_y=400, max_y=1850):
+        return
+    # لو القائمة طويلة ونزل الزر لأسفل الشاشة نسحب سحبة خفيفة للأعلى ثم نبحث عنه
+    if comp_num >= 2:
+        dev1.swipe(0.5, 0.75, 0.5, 0.35, steps=12)
+        smart_sleep(0.45, mult)
+        dump2 = dev1.dump_hierarchy()
+        if click_text_in_xml(dev1, dump2, add_labels, min_y=350, max_y=1850):
+            return
+    if comp_num == 1:
+        dev1.click(540, 1151)
+    elif comp_num == 2:
+        dev1.click(804, 943)
+    else:
+        dev1.click(804, 1106)
+
+
+def open_add_friend_and_send_request(dev1, comp_id: str, comp_num: int, mult: float = 1.0):
+    """فتح نافذة إضافة صديق في المحاكي الأول وكتابة الـ ID وإرسال الطلب بموثوقية عالية جداً"""
+    id_box = None
+    for attempt in range(3):
+        ensure_leader_on_friends_page(dev1, mult=mult)
+        _click_add_friend_on_show_all(dev1, comp_num, mult=mult)
+        id_box = wait_add_friend_dialog(dev1, timeout=(2.8 if attempt == 0 else 3.5) * mult)
+        if id_box is not None:
+            break
+        log.warning(f"إعادة محاولة فتح شاشة إضافة صديق في المحاكي الأول ({attempt + 1}/3)...")
+
+    if id_box is None:
+        save_failure_artifacts(dev1, "emu1_add_friend_fail")
+        raise FlowError("لم تظهر شاشة إضافة صديق في المحاكي الأول")
+
+    smart_sleep(0.25, mult)
+    wrote_id = False
+    try:
+        b = id_box.info.get("bounds", {})
+        cx = (b.get("left", 100) + b.get("right", 980)) // 2
+        cy = (b.get("top", 400) + b.get("bottom", 490)) // 2
+        dev1.click(cx, cy)
+        smart_sleep(0.2, mult)
+        id_box.set_text(comp_id)
+        wrote_id = True
+    except Exception:
+        wrote_id = False
+
+    if not wrote_id:
+        dev1.click(540, 445)
+        smart_sleep(0.25, mult)
+        dev1.send_keys(comp_id, clear=True)
+
+    smart_sleep(0.25, mult)
+    dev1.shell("input keyevent 111")
+    smart_sleep(0.35, mult)
+
+    dev1.click(540, 1742)
+    smart_sleep(1.5, mult)
+    wait_for_network_loading(dev1, max_wait=10.0)
+
+    # تأكيد إغلاق نافذة الإدخال وإرسال الطلب فعلياً
+    if is_add_friend_dialog_open(dev1):
+        log.warning("نافذة إدخال الصديق ما زالت مفتوحة - إعادة الضغط على زر الإرسال (540, 1742)...")
+        dev1.shell("input keyevent 111")
+        smart_sleep(0.3, mult)
+        dev1.click(540, 1742)
+        smart_sleep(1.5, mult)
+        wait_for_network_loading(dev1, max_wait=8.0)
+        if is_add_friend_dialog_open(dev1):
+            dev1.press("back")
+            smart_sleep(0.8, mult)
+
+
+def fast_extract_id_and_name(dev, max_wait: float = 4.0) -> Tuple[Optional[str], str]:
+    start_t = time.time()
+    nusuk_id = None
+    profile_name = "معتمر"
+
+    while time.time() - start_t < max_wait:
+        xml_str = dev.dump_hierarchy()
+
+        m = re.search(r"Nusuk ID\s*(\d+)", xml_str, re.IGNORECASE)
+        if m:
+            nusuk_id = m.group(1)
+        else:
+            m2 = re.search(r"\b(20\d{2}\d{8,12})\b", xml_str)
+            if m2:
+                nusuk_id = m2.group(1)
+
+        if nusuk_id:
+            try:
+                root = ET.fromstring(xml_str.encode("utf-8"))
+                for node in root.iter():
+                    txt = (node.attrib.get("text") or "").strip()
+                    bounds = node.attrib.get("bounds") or ""
+                    if txt and "Cards" not in txt and "Nusuk" not in txt and bounds:
+                        bm = re.match(r"\[(\d+),(\d+)\]\[(\d+),(\d+)\]", bounds)
+                        if bm:
+                            top_y = int(bm.group(2))
+                            if 140 <= top_y <= 260:
+                                profile_name = txt
+                                break
+            except Exception:
+                pass
+            return nusuk_id, profile_name
+
+        time.sleep(0.35)
+
+    return nusuk_id, profile_name
+
+
+def reach_profile_and_extract_id(dev, mult: float = 1.0) -> Tuple[Optional[str], str]:
+    """استخراج Nusuk ID والاسم مع محاولة استرجاع تلقائية لصفحة البروفايل لو تأخر الانتقال إليها"""
+    nid, pname = fast_extract_id_and_name(dev, max_wait=3.5 * mult)
+    if nid:
+        return nid, pname
+
+    dump = dev.dump_hierarchy()
+    dump_low = dump.lower()
+    if any(k in dump_low for k in SUCCESS_KEYS):
+        dev.click(540, 1793)
+        smart_sleep(1.3, mult)
+        wait_for_network_loading(dev, max_wait=6.0)
+        dev.click(1019, 91)
+        smart_sleep(1.5, mult)
+    elif any(k in dump for k in ("التصاريح", "Permits", "أكمل", "نوع الهوية")):
+        dev.click(1019, 91)
+        smart_sleep(1.5, mult)
+    else:
+        dev.click(65, 101)
+        smart_sleep(1.5, mult)
+
+    wait_for_network_loading(dev, max_wait=6.0)
+    return fast_extract_id_and_name(dev, max_wait=3.5 * mult)
+
+
+def _norm_key(s) -> str:
+    return str(s).strip().replace("أ", "ا").replace("إ", "ا").replace("آ", "ا").replace("ة", "ه").lower()
+
+
+def extract_field(p: dict, keys) -> str:
+    wanted = {_norm_key(k) for k in keys}
+    for k, v in p.items():
+        if _norm_key(k) in wanted:
+            return str(v).strip()
+    return ""
+
+
+def close_leader_group(dev1) -> bool:
+    log.info("إنهاء مجموعة الحساب الرئيسي من المحاكي الأول...")
+    ok = True
+    try:
+        if is_add_friend_dialog_open(dev1):
+            dev1.press("back")
+            time.sleep(0.8)
+        dump1 = dev1.dump_hierarchy()
+        if is_on_friends_show_all_page(dump1):
+            dev1.click(52, 103)
+            time.sleep(1.2)
+        perform_safe_logout(dev1, slow=True)
+        if not on_login_screen(dev1):
+            ok = force_clean_login_state(dev1, "emu1")
+    except Exception as e:
+        log.error(f"فشل خروج الحساب الرئيسي: {e}")
+        ok = force_clean_login_state(dev1, "emu1")
+    reset_group()
+    if ok:
+        bump_counter("emu1")
+    return ok
+
+
+# ==========================================
+# فحص تصاريح الروضة ونظام استرجاع الحساب
+# ==========================================
+def evaluate_rawdah_permits_from_xml(xml_str: str) -> Tuple[bool, str, dict]:
+    """
+    فحص تصاريح الروضة الشريفة من شاشة المواعيد:
+    - لو حاجز لنفسه حالياً (مؤكد / منتظر التأكيد / ساري) -> مينفعش
+    - لو مستخدم أو منتهي:
+      - لو عدى 365 يوم على أحدث تصريح -> ينفع
+      - لو لم يمر 365 يوم -> مينفعش
+    - لو لا توجد أي تصاريح روضة سابقة -> ينفع
+    """
+    try:
+        root = ET.fromstring(xml_str.encode("utf-8"))
+        nodes = [n.attrib.get("text", "").strip() for n in root.iter() if n.attrib.get("text")]
+    except Exception:
+        nodes = []
+
+    permits = []
+    curr = None
+    for t in nodes:
+        if "رقم الحجز" in t:
+            if curr:
+                permits.append(curr)
+            curr = {"id": t, "type": "", "status": "", "date_str": "", "time_str": "", "date": None}
+        elif curr:
+            if "تصريح الروضة" in t:
+                curr["type"] = t
+            elif any(s in t for s in ("مستخدم", "منتهي", "ساري", "ملغى", "ملغي", "مؤكد", "مؤكّد", "منتظر التأكيد", "بانتظار التأكيد")):
+                curr["status"] = t
+            elif re.match(r"^\d{1,2}:\d{2}$", t):
+                curr["time_str"] = t
+            else:
+                m = re.match(r"(\d{1,2})\s+([\u0621-\u064A]+)\s+(\d{4})", t)
+                if m:
+                    day, mon_name, yr = int(m.group(1)), m.group(2), int(m.group(3))
+                    mon = AR_MONTHS.get(mon_name)
+                    if mon:
+                        curr["date_str"] = t
+                        curr["date"] = datetime(yr, mon, day)
+    if curr:
+        permits.append(curr)
+
+    rawdah_permits = [p for p in permits if "الروضة" in p.get("type", "")]
+
+    # 1. هل المعتمر حاجز لنفسه حالياً (مؤكد أو بانتظار التأكيد)؟
+    active_keywords = ("مؤكد", "مؤكّد", "منتظر التأكيد", "بانتظار التأكيد", "ساري", "قادم", "فعال")
+    active_rawdah = [p for p in rawdah_permits if any(k in p.get("status", "") for k in active_keywords)]
+    if active_rawdah:
+        p = active_rawdah[0]
+        date_disp = p.get("date_str") or "محدد"
+        time_disp = p.get("time_str") or ""
+        stat_disp = p.get("status") or "مؤكد"
+        reason = f"مينفعش - المعتمر حاجز لنفسه تصريح روضة ({stat_disp}) بتاريخ {date_disp} {time_disp}".strip()
+        return False, reason, {"status": stat_disp, "date": date_disp, "time": time_disp, "type": p.get("type")}
+
+    # 2. فحص التصاريح السابقة (مستخدم / منتهي)
+    used_rawdah = [p for p in rawdah_permits if any(k in p.get("status", "") for k in ("مستخدم", "منتهي")) and p.get("date")]
+    now = datetime.now()
+    if used_rawdah:
+        latest = max(used_rawdah, key=lambda x: x["date"])
+        days_passed = (now - latest["date"]).days
+        date_disp = latest.get("date_str") or str(latest["date"].date())
+        if days_passed >= 365:
+            reason = f"ينفع - عدى أكثر من سنة ({days_passed} يوم) على آخر تصريح روضة بتاريخ {date_disp}"
+            return True, reason, {"status": latest.get("status"), "date": date_disp, "days_passed": days_passed, "type": latest.get("type")}
+        else:
+            reason = f"مينفعش - دخل الروضة بتاريخ {date_disp} (مر فقط {days_passed} يوم ولم يكمل سنة)"
+            return False, reason, {"status": latest.get("status"), "date": date_disp, "days_passed": days_passed, "type": latest.get("type")}
+
+    # 3. لا توجد تصاريح روضة مستخدمة أو مؤكدة
+    reason = "ينفع - لا توجد أي تصاريح روضة سابقة للمعتمر"
+    return True, reason, {"status": "none", "date": None}
+
+
+def run_account_recovery_flow(dev, req, role: str, comp_num: int, emu_key: str, mult: float = 1.0) -> dict:
+    p = req.pilgrim or {}
+    email_val = extract_field(p, ["email", "البريد الالكتروني", "البريد الإلكتروني", "Email", "الايميل"]) or req.client_email.strip()
+    password_val = extract_field(p, ["password", "الباسورد", "كلمة المرور", "Password", "pass"]) or DEFAULT_PASSWORD
+    passport_val = extract_field(p, ["رقم الجواز", "الجواز", "passport_number", "Passport", "passport", "رقم وثيقة السفر"])
+    visa_val = extract_field(p, ["رقم الفيزا", "الفيزا", "رقم التاشيره", "رقم التأشيرة", "التاشيره", "التأشيرة", "visa_number", "Visa", "visa"])
+    raw_nat = str(req.nationality or req.nationality_text or req.search_text or p.get("nationality") or "مصر").strip()
+    default_nat_y = int(req.nationality_y or req.option_y or req.choice_y or 275)
+
+    label = EMUS[emu_key]["label"]
+    log.info(f"🔄 [{label}] بدء مسار استرجاع الحساب للمعتمر: {passport_val} / {visa_val}...")
+
+    # 1. الانتقال لشاشة استعد حسابك
+    dump = dev.dump_hierarchy()
+    dump_clean = strip_arabic_diacritics(dump)
+
+    # إذا كانت نافذة "رقم الهوية مسجّل مسبقًا" مفتوحة، نضغط الزر الأسود "سجّل الخروج واستعد حسابك" (540, 1770)
+    if "سجل الخروج واستعد حسابك" in dump_clean or "مسجل مسبق" in dump_clean or "مسجل باسم حساب" in dump_clean:
+        log.info(f"[{label}] الضغط على زر 'سجّل الخروج واستعد حسابك'...")
+        if not click_text_in_xml(dev, dump, ("سجل الخروج واستعد حسابك", "استعد حسابك", "سجل الخروج"), min_y=1500, max_y=1850):
+            dev.click(540, 1770)
+        smart_sleep(1.5, mult)
+        wait_for_network_loading(dev, max_wait=10.0)
+        # الضغط مرتين في أعلى منتصف الشاشة لإغلاق أي نافذة منبثقة
+        dev.click(540, 300)
+        smart_sleep(0.5, mult)
+        dev.click(540, 300)
+        smart_sleep(0.8, mult)
+        dump = dev.dump_hierarchy()
+        dump_clean = strip_arabic_diacritics(dump)
+
+    # فحص الشاشة الحالية بعد الضغط على الزر الأسود (أو عند البدء اليدوي)
+    if "تسجيل الحساب من جديد" in dump_clean or "كافة الزوار" in dump_clean or "زائر دولي" in dump_clean:
+        log.info(f"[{label}] تم فتح شاشة 'تسجيل الحساب من جديد' مباشرة ✓")
+    elif "استعد حسابك" in dump_clean or "استعادة حسابك" in dump_clean:
+        if not click_text_in_xml(dev, dump, ("استعد حسابك", "استعادة حسابك"), min_y=1400, max_y=1850):
+            dev.click(780, 1650)
+        smart_sleep(1.5, mult)
+        wait_for_network_loading(dev, max_wait=8.0)
+    elif "لديك مشكلة" in dump_clean:
+        if not click_text_in_xml(dev, dump, ("لديك مشكلة",), min_y=600, max_y=1200):
+            dev.click(500, 845)
+        smart_sleep(1.2, mult)
+        dev.click(780, 1650)
+        smart_sleep(1.5, mult)
+        wait_for_network_loading(dev, max_wait=8.0)
+    else:
+        if not (any(m in dump_clean for m in WELCOME_MARKERS) or "تسجيل الدخول أو إنشاء حساب" in dump_clean or "الدخول بواسطة البريد" in dump_clean):
+            force_clean_login_state(dev, emu_key)
+            dump = dev.dump_hierarchy()
+            dump_clean = strip_arabic_diacritics(dump)
+
+        if any(m in dump_clean for m in WELCOME_MARKERS) or "تسجيل الدخول أو إنشاء حساب" in dump_clean:
+            dev.click(540, 1768)
+            smart_sleep(1.2, mult)
+
+        dump_sheet = dev.dump_hierarchy()
+        dump_sheet_clean = strip_arabic_diacritics(dump_sheet)
+        if "الدخول بواسطة البريد" in dump_sheet_clean or "البريد الإلكتروني" in dump_sheet_clean:
+            if not click_text_in_xml(dev, dump_sheet, ("الدخول بواسطة البريد",), min_y=1200, max_y=1700):
+                dev.click(796, 1484)
+            smart_sleep(1.2, mult)
+
+        dev.click(500, 845)
+        smart_sleep(1.2, mult)
+        dev.click(780, 1650)
+        smart_sleep(1.5, mult)
+        wait_for_network_loading(dev, max_wait=8.0)
+
+    # 2. شاشة "تسجيل الحساب من جديد" -> الضغط على "كافة الزوار" (540, 1690)
+    dump_rec = dev.dump_hierarchy()
+    dump_rec_clean = strip_arabic_diacritics(dump_rec)
+    if "كافة الزوار" in dump_rec_clean or "زائر دولي" in dump_rec_clean:
+        if not click_text_in_xml(dev, dump_rec, ("كافة الزوار", "زائر دولي"), min_y=500, max_y=1850):
+            dev.click(540, 1690)
+    else:
+        dev.click(540, 1690)
+    smart_sleep(1.2, mult)
+    wait_for_network_loading(dev, max_wait=8.0)
+
+    # 3. اختيار الجنسية
+    nat_y = smart_search_nationality(dev, raw_nat, default_nat_y, mult=mult)
+    dev.shell("input keyevent 111")
+    smart_sleep(0.4, mult)
+    dev.click(540, nat_y)
+    smart_sleep(0.4, mult)
+    dev.click(540, 1850)
+    wait_for_network_loading(dev, max_wait=8.0)
+
+    # 4. إدخال الجواز ورقم التأشيرة (مع أولوية set_text لضمان عدم ضياع أي حرف)
+    smart_sleep(0.8, mult)
+    dev.click(485, 770)  # اختيار راديو التأشيرة
+    smart_sleep(0.5, mult)
+
+    rec_inputs = wait_edits(dev, 2, timeout=3.5 * mult)
+    if rec_inputs is not None and len(rec_inputs) >= 2:
+        rec_inputs[0].set_text(passport_val)
+        smart_sleep(0.2, mult)
+        rec_inputs[1].set_text(visa_val)
+        smart_sleep(0.2, mult)
+    else:
+        dev.click(540, 600)  # جواز السفر
+        smart_sleep(0.3, mult)
+        dev.send_keys(passport_val, clear=True)
+        smart_sleep(0.3, mult)
+
+        dev.click(540, 890)  # رقم التأشيرة
+        smart_sleep(0.3, mult)
+        dev.send_keys(visa_val, clear=True)
+        smart_sleep(0.3, mult)
+
+    dev.shell("input keyevent 111")
+    smart_sleep(0.4, mult)
+
+    # الضغط على زر "التحقق من حسابك" (540, 1010)
+    dev.click(540, 1010)
+    smart_sleep(1.5, mult)
+    wait_for_network_loading(dev, max_wait=12.0)
+
+    # 5. إدخال الإيميل وكلمة المرور
+    cred_inputs = wait_edits(dev, 2, timeout=3.5 * mult)
+    if cred_inputs is not None and len(cred_inputs) >= 2:
+        cred_inputs[0].set_text(email_val)
+        smart_sleep(0.2, mult)
+        cred_inputs[1].set_text(password_val)
+        smart_sleep(0.2, mult)
+    else:
+        dev.click(540, 470)
+        smart_sleep(0.3, mult)
+        dev.send_keys(email_val, clear=True)
+        smart_sleep(0.3, mult)
+
+        dev.click(540, 600)
+        smart_sleep(0.3, mult)
+        dev.send_keys(password_val, clear=True)
+        smart_sleep(0.3, mult)
+
+    dev.shell("input keyevent 111")
+    smart_sleep(0.4, mult)
+
+    # الضغط على زر "تأكيد البريد الإلكتروني" (540, 1055)
+    otp_sent_at = time.time()
+    dev.click(540, 1055)
+    smart_sleep(1.8, mult)
+    wait_for_network_loading(dev, max_wait=12.0)
+
+    # 6. استلام كود OTP
+    log.info(f"[{label}] انتظار كود الـ OTP لاسترجاع الحساب من {req.client_email}...")
+    otp = fetch_nusuk_otp(req.client_email.strip(), req.client_pass, timeout=55, sent_after=otp_sent_at)
+    if not otp:
+        raise FlowError("لم يتم استلام كود OTP لاسترجاع الحساب")
+
+    dev.click(160, 240)
+    smart_sleep(0.2, mult)
+    dev.shell("input keyevent 67 67 67 67")
+    dev.shell(f"input text {otp}")
+    smart_sleep(0.4, mult)
+    dev.shell("input keyevent 111")
+
+    # انتظار ظهور نافذة "تم استعادة حسابك بنجاح" والضغط على الزر الأسود (تابع واستكشف)
+    log.info(f"[{label}] انتظار نافذة تم استعادة حسابك بنجاح والضغط على الزر الأسود...")
+    clicked_explore = False
+
+    for _ in range(25):
+        dump_succ = dev.dump_hierarchy()
+        if any(w in dump_succ for w in ("استعادة حسابك بنجاح", "استعادة حسابك", "تابع واستكشف", "استكشف")):
+            if not click_text_in_xml(dev, dump_succ, ("تابع واستكشف", "استكشف", "تابع"), min_y=1600, max_y=1900):
+                dev.click(540, 1793)
+            log.info(f"[{label}] تم الضغط على الزر الأسود (تابع واستكشف) بنجاح!")
+            clicked_explore = True
+            break
+        if "تأكيد البريد الإلكتروني" in dump_succ:
+            click_text_in_xml(dev, dump_succ, ("تأكيد البريد الإلكتروني",), min_y=700, max_y=950)
+        time.sleep(0.6)
+
+    if not clicked_explore:
+        dev.click(540, 1793)
+
+    smart_sleep(1.2, mult)
+
+    # إغلاق التطبيق وإعادة فتحه دائماً بعد كتابة OTP والضغط على الزر الأسود لضمان الاستقرار والدخول النظيف
+    log.info(f"🔄 [{label}] إعادة تشغيل تطبيق نسك بعد الاسترجاع والزر الأسود للوصول النظيف للشاشة الرئيسية...")
+    reopen_nusuk_app(dev, emu_key, mult=mult)
+
+    # 7. الضغط على دائرة البروفايل (أعلى اليسار 65, 101)
+    dev.click(65, 101)
+    smart_sleep(1.8, mult)
+    wait_for_network_loading(dev, max_wait=8.0)
+
+    # استخراج الاسم والـ Nusuk ID من البروفايل
+    nid, pname = fast_extract_id_and_name(dev, max_wait=4.0 * mult)
+    if not nid:
+        dump_p = dev.dump_hierarchy()
+        m_id = re.search(r"\b(202\d{9,12})\b", dump_p)
+        if m_id:
+            nid = m_id.group(1)
+
+    log.info(f"[{label}] تم استرجاع البروفايل: {pname} | ID: {nid}")
+
+    if getattr(req, "skip_permit_check", False):
+        eligible = True
+        reason = "تم تخطي فحص التصاريح السابقة يدوياً"
+        details = {"status": "skipped"}
+        log.info(f"⏭️ [{label}] تم تخطي فحص تصاريح الروضة لـ {pname}")
+    else:
+        # 8. الضغط على كرت "التصاريح السارية" (750, 1780)
+        dump_cards = dev.dump_hierarchy()
+        if not click_text_in_xml(dev, dump_cards, ("التصاريح السارية", "Active Permits"), min_y=1500, max_y=1920):
+            dev.click(750, 1780)
+        smart_sleep(2.0, mult)
+        wait_for_network_loading(dev, max_wait=10.0)
+
+        # 9. فحص التصاريح (المواعيد) وتقييم الأحقية
+        permits_xml = dev.dump_hierarchy()
+        eligible, reason, details = evaluate_rawdah_permits_from_xml(permits_xml)
+        log.info(f"📊 [{label}] نتيجة فحص الأحقية لـ {pname}: {reason}")
+
+        # الرجوع لصفحة البروفايل
+        dev.press("back")
+        smart_sleep(1.2, mult)
+
+    # 10. تنفيذ القرار
+    if not eligible:
+        log.warning(f"❌ [{label}] الحساب غير مؤهل ({reason}) -> تسجيل خروج آمن...")
+        perform_safe_logout(dev, slow=True)
+        # عمليات الاسترجاع لا تُحسب من ضمن عداد الـ 5 لتغيير البصمة
+        return {
+            "success": False,
+            "status": "ineligible_permit",
+            "eligible": False,
+            "reason": reason,
+            "pilgrim_name": pname,
+            "nusuk_id": nid,
+            "details": details,
+            "message": reason,
+        }
+
+    # الحساب مؤهل ("ينفع")!
+    log.info(f"✅ [{label}] الحساب مؤهل ({reason}) -> تنفيذ التوزيع...")
+
+    if role == "leader":
+        ensure_leader_on_friends_page(dev, mult=mult)
+        with _state_lock:
+            STATE["group"] = {
+                "leader_active": True,
+                "leader_name": pname,
+                "leader_id": nid,
+                "companions": [],
+            }
+        save_state()
+        return {
+            "success": True,
+            "status": "leader_registered",
+            "role": "leader",
+            "eligible": True,
+            "reason": reason,
+            "leader_name": pname,
+            "leader_id": nid,
+            "details": details,
+            "message": f"تم استرجاع الحساب واعتماده كرئيسي بنجاح ({reason})",
+        }
+
+    # مسار المرافق (companion على emu2)
+    dev2 = dev
+    dev1 = get_device(EMUS["emu1"]["serial"])
+    open_add_friend_and_send_request(dev1, nid, comp_num, mult=mult)
+
+    # قبول الطلب على emu2 مع التحقق من وصول الطلب والانتظار الكافي قبل السحب
+    leader_name = (STATE.get("group") or {}).get("leader_name") or ""
+    dump_dev2 = ""
+    for attempt in range(2):
+        dev2.click(1019, 91)
+        time.sleep(1.0)
+        dev2.click(65, 101)
+        time.sleep(2.0)
+        wait_for_network_loading(dev2, max_wait=10.0)
+        dump_dev2 = dev2.dump_hierarchy()
+        if any(k in dump_dev2 for k in ("قبول", "موافقة", "Accept", "Approve", "طلب", "Request")) or (leader_name and leader_name in dump_dev2):
+            break
+
+    if not click_text_in_xml(dev2, dump_dev2, ("قبول", "موافقة", "Accept", "Approve"), min_y=250, max_y=650):
+        dev2.click(207, 408)
+    time.sleep(1.5)
+    wait_for_network_loading(dev2, max_wait=8.0)
+
+    with _state_lock:
+        STATE["group"]["companions"].append({"name": pname, "id": nid})
+        group_count = len(STATE["group"]["companions"])
+    save_state()
+
+    perform_safe_logout(dev2, slow=True)
+    log.info(f"[✓] تم ربط المرافق المسترجع {comp_num} ({pname}) بنجاح! (استرجاع - لا يُحسب في عداد تغيير البصمة)")
+
+    if group_count >= MAX_COMPANIONS:
+        if getattr(req, "auto_close_group", True):
+            log.info("اكتملت المجموعة (4 أفراد)! جاري إغلاق مجموعة المحاكي الأول...")
+            close_leader_group(dev1)
+        else:
+            log.info("اكتملت المجموعة (4 أفراد)! تم إبقاء الحساب الرئيسي مفتوحاً للحجز (auto_close_group=False)")
+
+    return {
+        "success": True,
+        "status": "companion_linked",
+        "role": "companion",
+        "eligible": True,
+        "reason": reason,
+        "companion_name": pname,
+        "companion_id": nid,
+        "group_count": group_count,
+        "details": details,
+        "message": f"تم استرجاع الحساب وربطه كمرافق {comp_num} بنجاح ({reason})",
+    }
+
+
+# ==========================================
+# تشفير وفك تشفير طلبات الروضة (Rawdah v2 AES-128-CBC)
+# ==========================================
+# ============================================================ Pure-Python AES-128
+SBOX = [
+    0x63,0x7c,0x77,0x7b,0xf2,0x6b,0x6f,0xc5,0x30,0x01,0x67,0x2b,0xfe,0xd7,0xab,0x76,
+    0xca,0x82,0xc9,0x7d,0xfa,0x59,0x47,0xf0,0xad,0xd4,0xa2,0xaf,0x9c,0xa4,0x72,0xc0,
+    0xb7,0xfd,0x93,0x26,0x36,0x3f,0xf7,0xcc,0x34,0xa5,0xe5,0xf1,0x71,0xd8,0x31,0x15,
+    0x04,0xc7,0x23,0xc3,0x18,0x96,0x05,0x9a,0x07,0x12,0x80,0xe2,0xeb,0x27,0xb2,0x75,
+    0x09,0x83,0x2c,0x1a,0x1b,0x6e,0x5a,0xa0,0x52,0x3b,0xd6,0xb3,0x29,0xe3,0x2f,0x84,
+    0x53,0xd1,0x00,0xed,0x20,0xfc,0xb1,0x5b,0x6a,0xcb,0xbe,0x39,0x4a,0x4c,0x58,0xcf,
+    0xd0,0xef,0xaa,0xfb,0x43,0x4d,0x33,0x85,0x45,0xf9,0x02,0x7f,0x50,0x3c,0x9f,0xa8,
+    0x51,0xa3,0x40,0x8f,0x92,0x9d,0x38,0xf5,0xbc,0xb6,0xda,0x21,0x10,0xff,0xf3,0xd2,
+    0xcd,0x0c,0x13,0xec,0x5f,0x97,0x44,0x17,0xc4,0xa7,0x7e,0x3d,0x64,0x5d,0x19,0x73,
+    0x60,0x81,0x4f,0xdc,0x22,0x2a,0x90,0x88,0x46,0xee,0xb8,0x14,0xde,0x5e,0x0b,0xdb,
+    0xe0,0x32,0x3a,0x0a,0x49,0x06,0x24,0x5c,0xc2,0xd3,0xac,0x62,0x91,0x95,0xe4,0x79,
+    0xe7,0xc8,0x37,0x6d,0x8d,0xd5,0x4e,0xa9,0x6c,0x56,0xf4,0xea,0x65,0x7a,0xae,0x08,
+    0xba,0x78,0x25,0x2e,0x1c,0xa6,0xb4,0xc6,0xe8,0xdd,0x74,0x1f,0x4b,0xbd,0x8b,0x8a,
+    0x70,0x3e,0xb5,0x66,0x48,0x03,0xf6,0x0e,0x61,0x35,0x57,0xb9,0x86,0xc1,0x1d,0x9e,
+    0xe1,0xf8,0x98,0x11,0x69,0xd9,0x8e,0x94,0x9b,0x1e,0x87,0xe9,0xce,0x55,0x28,0xdf,
+    0x8c,0xa1,0x89,0x0d,0xbf,0xe6,0x42,0x68,0x41,0x99,0x2d,0x0f,0xb0,0x54,0xbb,0x16,
+]
+INV_SBOX = [
+    0x52,0x09,0x6a,0xd5,0x30,0x36,0xa5,0x38,0xbf,0x40,0xa3,0x9e,0x81,0xf3,0xd7,0xfb,
+    0x7c,0xe3,0x39,0x82,0x9b,0x2f,0xff,0x87,0x34,0x8e,0x43,0x44,0xc4,0xde,0xe9,0xcb,
+    0x54,0x7b,0x94,0x32,0xa6,0xc2,0x23,0x3d,0xee,0x4c,0x95,0x0b,0x42,0xfa,0xc3,0x4e,
+    0x08,0x2e,0xa1,0x66,0x28,0xd9,0x24,0xb2,0x76,0x5b,0xa2,0x49,0x6d,0x8b,0xd1,0x25,
+    0x72,0xf8,0xf6,0x64,0x86,0x68,0x98,0x16,0xd4,0xa4,0x5c,0xcc,0x5d,0x65,0xb6,0x92,
+    0x6c,0x70,0x48,0x50,0xfd,0xed,0xb9,0xda,0x5e,0x15,0x46,0x57,0xa7,0x8d,0x9d,0x84,
+    0x90,0xd8,0xab,0x00,0x8c,0xbc,0xd3,0x0a,0xf7,0xe4,0x58,0x05,0xb8,0xb3,0x45,0x06,
+    0xd0,0x2c,0x1e,0x8f,0xca,0x3f,0x0f,0x02,0xc1,0xaf,0xbd,0x03,0x01,0x13,0x8a,0x6b,
+    0x3a,0x91,0x11,0x41,0x4f,0x67,0xdc,0xea,0x97,0xf2,0xcf,0xce,0xf0,0xb4,0xe6,0x73,
+    0x96,0xac,0x74,0x22,0xe7,0xad,0x35,0x85,0xe2,0xf9,0x37,0xe8,0x1c,0x75,0xdf,0x6e,
+    0x47,0xf1,0x1a,0x71,0x1d,0x29,0xc5,0x89,0x6f,0xb7,0x62,0x0e,0xaa,0x18,0xbe,0x1b,
+    0xfc,0x56,0x3e,0x4b,0xc6,0xd2,0x79,0x20,0x9a,0xdb,0xc0,0xfe,0x78,0xcd,0x5a,0xf4,
+    0x1f,0xdd,0xa8,0x33,0x88,0x07,0xc7,0x31,0xb1,0x12,0x10,0x59,0x27,0x80,0xec,0x5f,
+    0x60,0x51,0x7f,0xa9,0x19,0xb5,0x4a,0x0d,0x2d,0xe5,0x7a,0x9f,0x93,0xc9,0x9c,0xef,
+    0xa0,0xe0,0x3b,0x4d,0xae,0x2a,0xf5,0xb0,0xc8,0xeb,0xbb,0x3c,0x83,0x53,0x99,0x61,
+    0x17,0x2b,0x04,0x7e,0xba,0x77,0xd6,0x26,0xe1,0x69,0x14,0x63,0x55,0x21,0x0c,0x7d,
+]
+RCON = [0x01,0x02,0x04,0x08,0x10,0x20,0x40,0x80,0x1b,0x36]
+
+
+def _xtime(a):
+    return (((a << 1) ^ 0x1b) & 0xff) if (a & 0x80) else ((a << 1) & 0xff)
+
+
+def _expand_key(key16):
+    w = [list(key16[i:i+4]) for i in range(0, 16, 4)]
+    for i in range(4, 44):
+        t = list(w[i-1])
+        if i % 4 == 0:
+            t = [SBOX[t[1]], SBOX[t[2]], SBOX[t[3]], SBOX[t[0]]]
+            t[0] ^= RCON[i//4 - 1]
+        w.append([w[i-4][j] ^ t[j] for j in range(4)])
+    # 11 مفاتيح جولة، كل واحد 16 بايت مسطّح
+    return [[b for i in range(4) for b in w[4*r + i]] for r in range(11)]
+
+
+def _add_round_key(s, rk):
+    return [s[i] ^ rk[i] for i in range(16)]
+
+
+def _sub_bytes(s):
+    return [SBOX[b] for b in s]
+
+
+def _inv_sub_bytes(s):
+    return [INV_SBOX[b] for b in s]
+
+
+def _shift_rows(s):
+    return [
+        s[0], s[5], s[10], s[15],
+        s[4], s[9], s[14], s[3],
+        s[8], s[13], s[2], s[7],
+        s[12], s[1], s[6], s[11],
+    ]
+
+
+def _inv_shift_rows(s):
+    return [
+        s[0], s[13], s[10], s[7],
+        s[4], s[1], s[14], s[11],
+        s[8], s[5], s[2], s[15],
+        s[12], s[9], s[6], s[3],
+    ]
+
+
+def _mix_columns(s):
+    out = [0]*16
+    for c in range(4):
+        a0,a1,a2,a3 = s[4*c], s[4*c+1], s[4*c+2], s[4*c+3]
+        out[4*c]   = _xtime(a0) ^ (_xtime(a1) ^ a1) ^ a2 ^ a3
+        out[4*c+1] = a0 ^ _xtime(a1) ^ (_xtime(a2) ^ a2) ^ a3
+        out[4*c+2] = a0 ^ a1 ^ _xtime(a2) ^ (_xtime(a3) ^ a3)
+        out[4*c+3] = (_xtime(a0) ^ a0) ^ a1 ^ a2 ^ _xtime(a3)
+    return out
+
+
+def _mul(a, b):
+    """GF(2^8) ضرب مع كثيرة الحدود 0x11b."""
+    p = 0
+    for _ in range(8):
+        if b & 1:
+            p ^= a
+        hi = a & 0x80
+        a = (a << 1) & 0xff
+        if hi:
+            a ^= 0x1b
+        b >>= 1
+    return p
+
+
+def _inv_mix_columns(s):
+    out = [0]*16
+    for c in range(4):
+        a0,a1,a2,a3 = s[4*c], s[4*c+1], s[4*c+2], s[4*c+3]
+        out[4*c]   = _mul(a0,14) ^ _mul(a1,11) ^ _mul(a2,13) ^ _mul(a3,9)
+        out[4*c+1] = _mul(a0,9)  ^ _mul(a1,14) ^ _mul(a2,11) ^ _mul(a3,13)
+        out[4*c+2] = _mul(a0,13) ^ _mul(a1,9)  ^ _mul(a2,14) ^ _mul(a3,11)
+        out[4*c+3] = _mul(a0,11) ^ _mul(a1,13) ^ _mul(a2,9)  ^ _mul(a3,14)
+    return out
+
+
+def _encrypt_block(block, keys):
+    s = _add_round_key(block, keys[0])
+    for rnd in range(1, 10):
+        s = _sub_bytes(s)
+        s = _shift_rows(s)
+        s = _mix_columns(s)
+        s = _add_round_key(s, keys[rnd])
+    s = _sub_bytes(s)
+    s = _shift_rows(s)
+    s = _add_round_key(s, keys[10])
+    return s
+
+
+def _decrypt_block(block, keys):
+    s = _add_round_key(block, keys[10])
+    for rnd in range(9, 0, -1):
+        s = _inv_shift_rows(s)
+        s = _inv_sub_bytes(s)
+        s = _add_round_key(s, keys[rnd])
+        s = _inv_mix_columns(s)
+    s = _inv_shift_rows(s)
+    s = _inv_sub_bytes(s)
+    s = _add_round_key(s, keys[0])
+    return s
+
+
+def _pkcs7_pad(data, block_size=16):
+    n = block_size - (len(data) % block_size)
+    return data + bytes([n]) * n
+
+
+def _pkcs7_unpad(data):
+    n = data[-1]
+    assert 1 <= n <= 16
+    return data[:-n]
+
+
+def aes128_cbc_encrypt(key, iv, plaintext):
+    assert len(key) == 16 and len(iv) == 16
+    keys = _expand_key(key)
+    pt = _pkcs7_pad(plaintext)
+    out = bytearray()
+    prev = list(iv)
+    for i in range(0, len(pt), 16):
+        blk = [pt[i+j] ^ prev[j] for j in range(16)]
+        enc = _encrypt_block(blk, keys)
+        out += bytes(enc)
+        prev = enc
+    return bytes(out)
+
+
+def aes128_cbc_decrypt(key, iv, ciphertext):
+    assert len(key) == 16 and len(iv) == 16
+    keys = _expand_key(key)
+    prev = list(iv)
+    out = bytearray()
+    for i in range(0, len(ciphertext), 16):
+        dec = _decrypt_block(list(ciphertext[i:i+16]), keys)
+        out += bytes(dec[j] ^ prev[j] for j in range(16))
+        prev = list(ciphertext[i:i+16])
+    return _pkcs7_unpad(bytes(out))
+
+
+# ============================================================ Rawdah encryption
+
+def random_key(n=16):
+    alphabet = string.ascii_lowercase + string.ascii_uppercase + string.digits
+    return "".join(random.choice(alphabet) for _ in range(n))
+
+
+def encrypt_rawdah(request_dict, key=None):
+    """يحاكي a86.d + a86.a. يرجع (data, key)."""
+    key = key or random_key(16)
+    k = key.encode("utf-8")
+    assert len(k) == 16
+    json_bytes = json.dumps(request_dict, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+    enc = aes128_cbc_encrypt(k, k, json_bytes)      # key == IV == K
+    b64 = base64.b64encode(enc).decode("ascii")
+    data = key[:4] + b64 + key[4:]                  # K[0:4] + b64 + K[4:16]
+    return data, key
+
+
+def decrypt_rawdah(data):
+    """عكس العملية (للتحقق)."""
+    key = data[:4] + data[-12:]
+    k = key.encode("utf-8")
+    b64 = data[4:-12]
+    enc = base64.b64decode(b64)
+    plain = aes128_cbc_decrypt(k, k, enc)
+    return json.loads(plain.decode("utf-8"))
+
+
+def build_rawdah_request(count: int = 1, date: str = "2026-11-21", to_date: str = "2026-12-21", date_type: int = 1, queue_type: int = 0, service_id: int = 1, latitude: float = 24.4709, longitude: float = 39.6122):
+    return {
+        "Request": {
+            "Count": count,
+            "Date": date,
+            "DateType": date_type,
+            "Location": {"Latitude": latitude, "Longitude": longitude},
+            "QueueType": queue_type,
+            "ServiceID": service_id,
+            "ToDate": to_date,
+        }
+    }
+
+
+# ==========================================
+# تعريف تطبيق FastAPI والـ Endpoints
+# ==========================================
+app = FastAPI(title="Nusuk Dual-Emulator Pro Engine (Anti-Lag)")
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=ALLOWED_ORIGINS,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+app.mount("/fail_shots", StaticFiles(directory=SHOTS_DIR), name="fail_shots")
+app.mount("/booking_shots", StaticFiles(directory=BOOKING_SHOTS_DIR), name="booking_shots")
+
+
+class RegisterRequest(BaseModel):
+    client_email: str
+    client_pass: str
+    pilgrim: dict
+    nationality: Optional[str] = None
+    nationality_text: Optional[str] = None
+    search_text: Optional[str] = None
+    nationality_y: Optional[int] = None
+    option_y: Optional[int] = None
+    choice_y: Optional[int] = None
+    force_role: Optional[str] = None
+    speed_multiplier: Optional[float] = None
+    skip_permit_check: bool = False
+    auto_close_group: bool = True
+
+
+BUSY_RESPONSE = {"success": False, "status": "busy", "error": "في عملية أخرى شغالة على المحاكيات حالياً، حاول بعد انتهائها"}
+
+
+@app.get("/api/status")
+def get_status():
+    with _state_lock:
+        group = copy.deepcopy(STATE["group"])
+        counters = dict(STATE["counters"])
+        health = copy.deepcopy(STATE["health"])
+        speed_mult = STATE.get("speed_multiplier", 1.0)
+    next_role = "companion" if group["leader_active"] else "leader"
+    next_emu = (
+        f"المحاكي الثاني (مرافق رقم {len(group['companions']) + 1})"
+        if next_role == "companion" else "المحاكي الأول (حساب رئيسي جديد)"
+    )
+    return {
+        "status": "ready",
+        "busy": OP_LOCK.locked(),
+        "emu1_counter": counters["emu1"],
+        "emu2_counter": counters["emu2"],
+        "leader_active": group["leader_active"],
+        "leader_name": group["leader_name"],
+        "leader_id": group["leader_id"],
+        "companions": group["companions"],
+        "companions_count": len(group["companions"]),
+        "max_companions": MAX_COMPANIONS,
+        "next_role": next_role,
+        "next_target": next_emu,
+        "health": health,
+        "speed_multiplier": speed_mult,
+    }
+
+
+@app.post("/api/set-speed")
+def set_speed_api(multiplier: float = 1.0):
+    mult = max(0.8, min(3.0, float(multiplier)))
+    with _state_lock:
+        STATE["speed_multiplier"] = mult
+    save_state()
+    log.info(f"تم تغيير معامل سرعة الانتظار إلى: {mult}x")
+    return {"success": True, "speed_multiplier": mult}
+
+
+@app.get("/api/health")
+def health_check():
+    busy = OP_LOCK.locked()
+    result = {"busy": busy, "emulators": {}}
+    all_ok = True
+    for key, emu in EMUS.items():
+        with _state_lock:
+            h = dict(STATE["health"][key])
+            counter = STATE["counters"][key]
+        item = {
+            "label": emu["label"], "serial": emu["serial"], "counter": counter,
+            "healthy": h["ok"], "reason": h["reason"], "connected": None,
+        }
+        if busy:
+            item["note"] = "عملية شغالة - تم تخطي فحص الجهاز"
+        else:
+            try:
+                dev = get_device(emu["serial"], timeout=6)
+                w, hgt = dev.window_size()
+                pkg = dev.app_current().get("package")
+                item.update({
+                    "connected": True, "screen": f"{w}x{hgt}",
+                    "foreground_app": pkg, "nusuk_in_foreground": pkg == PACKAGE_NAME,
+                })
+            except Exception as e:
+                item.update({"connected": False, "error": str(e)})
+        if not h["ok"] or item["connected"] is False:
+            all_ok = False
+        result["emulators"][key] = item
+    result["ok"] = all_ok
+    return result
+
+
+@app.post("/api/reset-state")
+def reset_state_api(reset_counters: bool = False):
+    with exclusive(LOCK_WAIT) as got:
+        if not got:
+            return BUSY_RESPONSE
+        reset_group()
+        with _state_lock:
+            for k in STATE["health"]:
+                STATE["health"][k] = {"ok": True, "reason": ""}
+            if reset_counters:
+                for k in STATE["counters"]:
+                    STATE["counters"][k] = 0
+        save_state()
+        log.warning(f"تم تصفير الحالة يدوياً (reset_counters={reset_counters})")
+        return {"success": True, "message": "تم تصفير المجموعة وحالة السلامة", "counters_reset": reset_counters}
+
+
+@app.post("/api/randomize-emulator")
+def randomize_emulator_api(emu_key: str):
+    """تغيير بصمة محاكي محدد (emu1 أو emu2) يدوياً وإعادة تشغيله وتصفير عداده"""
+    if emu_key not in EMUS:
+        return {"success": False, "message": "اسم المحاكي غير صحيح"}
+    with exclusive(LOCK_WAIT) as got:
+        if not got:
+            return BUSY_RESPONSE
+        label = EMUS[emu_key]["label"]
+        log.info(f"طلب يدوي لتغيير البصمة وإعادة تشغيل {label}...")
+        ok = restart_and_randomize_ldplayer(emu_key)
+        if ok:
+            with _state_lock:
+                STATE["counters"][emu_key] = 0
+            save_state()
+            return {"success": True, "message": f"تم تغيير بصمة {label} وإعادة تشغيله بنجاح"}
+        return {"success": False, "message": f"حدث خطأ أثناء إعادة تشغيل {label}"}
+
+
+@app.post("/api/force-close-group")
+def force_close_group_api():
+    with exclusive(LOCK_WAIT) as got:
+        if not got:
+            return BUSY_RESPONSE
+        with _state_lock:
+            active = STATE["group"]["leader_active"]
+        if not active:
+            return {"success": False, "message": "لا يوجد حساب رئيسي نشط حالياً"}
+        try:
+            dev1 = get_device(EMUS["emu1"]["serial"])
+            ok = close_leader_group(dev1)
+        except Exception as e:
+            log.exception("فشل إنهاء المجموعة")
+            return {"success": False, "message": f"فشل إنهاء المجموعة: {e}"}
+        if ok:
+            return {"success": True, "message": "تم إنهاء المجموعة وتسجيل خروج الحساب الرئيسي"}
+        return {"success": False, "message": "تم تصفير المجموعة لكن المحاكي الأول يحتاج رجوع يدوي لشاشة الدخول"}
+
+
+@app.post("/api/register")
+def execute_workflow(req: RegisterRequest):
+    with exclusive(LOCK_WAIT) as got:
+        if not got:
+            return BUSY_RESPONSE
+        try:
+            return _run_register(req)
+        except Exception as e:
+            log.exception("خطأ غير متوقع في /api/register")
+            return {"success": False, "status": "error", "error": f"خطأ غير متوقع: {e}"}
+
+
+@app.post("/api/recover")
+def recover_account_api(req: RegisterRequest):
+    """استرجاع حساب مسجل مسبقاً وفحص صلاحية تصاريح الروضة يدوياً أو برمجياً"""
+    with exclusive(LOCK_WAIT) as got:
+        if not got:
+            return BUSY_RESPONSE
+        try:
+            with _state_lock:
+                leader_active = STATE["group"]["leader_active"]
+                comp_count = len(STATE["group"]["companions"])
+            role = req.force_role or ("companion" if leader_active else "leader")
+            emu_key = "emu1" if role == "leader" else "emu2"
+            comp_num = comp_count + 1
+            mult = float(req.speed_multiplier or STATE.get("speed_multiplier", 1.0))
+            dev = get_device(EMUS[emu_key]["serial"])
+            return run_account_recovery_flow(dev, req, role, comp_num, emu_key, mult=mult)
+        except Exception as e:
+            log.exception("خطأ في /api/recover")
+            return {"success": False, "status": "error", "error": str(e)}
+
+
+def _run_register(req: RegisterRequest) -> dict:
+    p = req.pilgrim or {}
+    dummy_name = "Ab"
+    mult = float(req.speed_multiplier or STATE.get("speed_multiplier", 1.0))
+
+    email_val = extract_field(p, ["email", "البريد الالكتروني", "البريد الإلكتروني", "Email", "الايميل"]) or req.client_email.strip()
+    password_val = extract_field(p, ["password", "الباسورد", "كلمة المرور", "Password", "pass"]) or DEFAULT_PASSWORD
+    passport_val = extract_field(p, ["رقم الجواز", "الجواز", "passport_number", "Passport", "passport", "رقم وثيقة السفر"])
+    visa_val = extract_field(p, ["رقم الفيزا", "الفيزا", "رقم التاشيره", "رقم التأشيرة", "التاشيره", "التأشيرة", "visa_number", "Visa", "visa"])
+    force_role = (req.force_role or "").strip().lower() or None
+
+    problems = []
+    if not EMAIL_RE.fullmatch(req.client_email.strip()):
+        problems.append("client_email غير صالح")
+    if not req.client_pass.strip():
+        problems.append("client_pass فارغ")
+    if not EMAIL_RE.fullmatch(email_val):
+        problems.append("إيميل الحاج غير صالح")
+    if not password_val:
+        problems.append("لا توجد كلمة مرور")
+    if not passport_val:
+        problems.append("رقم الجواز فارغ")
+    if not visa_val:
+        problems.append("رقم التأشيرة فارغ")
+    if problems:
+        log.warning("طلب مرفوض: " + " | ".join(problems))
+        return {"success": False, "status": "invalid_input", "error": " | ".join(problems)}
+
+    with _state_lock:
+        leader_active = STATE["group"]["leader_active"]
+        comp_count = len(STATE["group"]["companions"])
+
+    role = force_role or ("companion" if leader_active else "leader")
+    if role == "companion" and not leader_active:
+        return {"success": False, "status": "invalid_state", "error": "لا يوجد حساب رئيسي نشط - سجّل الرئيسي أولاً"}
+    if role == "leader" and leader_active:
+        return {"success": False, "status": "invalid_state", "error": "يوجد حساب رئيسي نشط - أنهِ المجموعة أولاً"}
+
+    emu_key = "emu1" if role == "leader" else "emu2"
+    emu = EMUS[emu_key]
+    comp_num = comp_count + 1
+    label = "المحاكي الأول (رئيسي)" if role == "leader" else f"المحاكي الثاني (مرافق {comp_num})"
+
+    dev = get_device(emu["serial"])
+    dev1 = None
+
+    log.info("=" * 55)
+    log.info(f"بدء تسجيل على [{label}] (السرعة: {mult}x) | الجواز: {passport_val} | التأشيرة: {visa_val}")
+
+    try:
+        if not force_clean_login_state(dev, emu_key):
+            raise FlowError(f"{label} ليس على شاشة الدخول وتعذر تنظيفه تلقائياً")
+
+        # لو نسجل مرافق، نتأكد أن المحاكي الأول (الرئيسي) متصل وتطبيق نسك مفتوح عليه قبل البدء
+        if role == "companion":
+            dev1 = get_device(EMUS["emu1"]["serial"])
+            if dev1.app_current().get("package") != PACKAGE_NAME:
+                log.warning("المحاكي الأول (الرئيسي) خرج من تطبيق نسك! جاري إعادة فتحه قبل تسجيل المرافق...")
+                reopen_nusuk_app(dev1, "emu1", mult=mult)
+            ensure_leader_on_friends_page(dev1, mult=mult)
+
+        # 1. فتح شاشة إنشاء الحساب (تخطي الزر الأسود 540,1768 ثم أنشئ حسابًا جديدًا 540,1704)
+        smart_sleep(0.4, mult)
+        inputs = open_registration_form(dev, mult=mult)
+        if inputs is None:
+            raise FlowError("لم تظهر شاشة التسجيل (تأكد من اتصال الإنترنت)")
+        smart_sleep(0.3, mult)
+
+        # 2. ملء البيانات الأساسية
+        inputs[0].set_text(dummy_name)
+        smart_sleep(0.15, mult)
+        inputs[1].set_text(email_val)
+        smart_sleep(0.15, mult)
+        inputs[2].set_text(password_val)
+        smart_sleep(0.2, mult)
+
+        dev.shell("input keyevent 111")
+        smart_sleep(0.4, mult)
+
+        # الضغط على زر التأكيد النهائي (أنشئ حسابك) بعد ملء الـ 3 خانات في إحداثياته الجديدة (558, 1138)
+        otp_sent_at = time.time()
+        dev.click(558, 1138)
+        smart_sleep(1.8, mult)
+        wait_for_network_loading(dev, max_wait=12.0)
+
+        # 3. استلام وإدخال كود OTP
+        otp = fetch_nusuk_otp(req.client_email.strip(), req.client_pass, timeout=55, sent_after=otp_sent_at)
+        if not otp:
+            raise FlowError("لم يتم استلام كود OTP")
+
+        dev.click(160, 462)
+        smart_sleep(0.2, mult)
+        dev.shell("input keyevent 67 67 67 67")
+        dev.shell(f"input text {otp}")
+        smart_sleep(0.2, mult)
+        dev.shell("input keyevent 111")
+
+        # 4. انتظار انتهاء تحميل الـ OTP ثم 3 نقرات تنظيف
+        smart_sleep(1.8, mult)
+        wait_for_network_loading(dev, max_wait=12.0)
+        for _ in range(3):
+            dev.click(1000, 100)
+            smart_sleep(0.3, mult)
+
+        # 5. الدخول للملف الشخصي ثم Active Permits ثم Complete Profile
+        dev.click(65, 101)
+        smart_sleep(1.6, mult)
+        wait_for_network_loading(dev, max_wait=8.0)
+
+        dev.click(807, 1786)
+        smart_sleep(1.3, mult)
+        wait_for_network_loading(dev, max_wait=8.0)
+        dump_step5 = dev.dump_hierarchy()
+        if "عرض الكل" in dump_step5 or "بطاقاتي" in dump_step5 or "Show All" in dump_step5:
+            dev.click(807, 1786)
+            smart_sleep(1.2, mult)
+            wait_for_network_loading(dev, max_wait=6.0)
+
+        dev.click(540, 1793)
+        smart_sleep(1.3, mult)
+
+        # 6. اختيار زائر دولي
+        dev.click(540, 886)
+        smart_sleep(1.3, mult)
+
+        # 7. اختيار الجنسية
+        raw_nat = str(req.nationality or req.nationality_text or req.search_text or p.get("nationality") or "مصر").strip()
+        default_nat_y = int(req.nationality_y or req.option_y or req.choice_y or 275)
+
+        dev.click(540, 491)
+        if wait_edits(dev, 1, timeout=4.5 * mult) is None:
+            dump_step6 = dev.dump_hierarchy()
+            if "نوع الهوية" in dump_step6 or "زائر دولي" in dump_step6 or "International" in dump_step6:
+                dev.click(540, 886)
+                smart_sleep(1.2, mult)
+            dev.click(540, 491)
+            if wait_edits(dev, 1, timeout=4.5 * mult) is None:
+                raise FlowError("لم تظهر قائمة الجنسية بسبب بطء الاستجابة")
+        smart_sleep(0.3, mult)
+
+        nat_y = smart_search_nationality(dev, raw_nat, default_nat_y, mult=mult)
+        dev.shell("input keyevent 111")
+        smart_sleep(0.4, mult)
+
+        dev.click(540, nat_y)
+        smart_sleep(0.4, mult)
+        dev.click(540, 1850)
+        wait_for_network_loading(dev, max_wait=8.0)
+
+        # 8. بيانات الجواز والتأشيرة
+        all_inputs = wait_edits(dev, 2, timeout=6.0 * mult)
+        if all_inputs is None:
+            dev.click(540, 1850)
+            all_inputs = wait_edits(dev, 2, timeout=5.0 * mult)
+        if all_inputs is None:
+            raise FlowError("لم تظهر خانات الجواز والتأشيرة")
+        smart_sleep(0.2, mult)
+        all_inputs[0].set_text(passport_val)
+        smart_sleep(0.15, mult)
+        all_inputs[1].set_text(visa_val)
+        smart_sleep(0.15, mult)
+
+        dev.shell("input keyevent 111")
+        smart_sleep(0.4, mult)
+
+        # 9. زر الحفظ النهائي وفحص النتيجة
+        dev.click(540, 1040)
+        smart_sleep(1.2, mult)
+        wait_for_network_loading(dev, max_wait=15.0)
+
+        outcome = None
+        for _ in range(14):
+            raw_dump = dev.dump_hierarchy()
+            screen_dump = strip_arabic_diacritics(raw_dump).lower()
+            if any(strip_arabic_diacritics(k).lower() in screen_dump for k in ALREADY_KEYS):
+                outcome = "already"
+                break
+            if any(strip_arabic_diacritics(k).lower() in screen_dump for k in SUCCESS_KEYS):
+                outcome = "success"
+                break
+            time.sleep(0.5)
+
+        if outcome is None and len(dev(className="android.widget.EditText")) >= 2:
+            dev.shell("input keyevent 111")
+            smart_sleep(0.3, mult)
+            dev.click(540, 1040)
+            smart_sleep(1.2, mult)
+            wait_for_network_loading(dev, max_wait=10.0)
+            for _ in range(10):
+                raw_dump = dev.dump_hierarchy()
+                screen_dump = strip_arabic_diacritics(raw_dump).lower()
+                if any(strip_arabic_diacritics(k).lower() in screen_dump for k in ALREADY_KEYS):
+                    outcome = "already"
+                    break
+                if any(strip_arabic_diacritics(k).lower() in screen_dump for k in SUCCESS_KEYS):
+                    outcome = "success"
+                    break
+                time.sleep(0.5)
+
+        if outcome == "already":
+            log.warning("الحساب مسجل مسبقاً! الضغط على الزر الأسود 'سجّل الخروج واستعد حسابك' وبدء مسار استرجاع الحساب تلقائياً...")
+            dump_alr = dev.dump_hierarchy()
+            if not click_text_in_xml(dev, dump_alr, ("سجل الخروج واستعد حسابك", "استعد حسابك", "سجل الخروج"), min_y=1500, max_y=1850):
+                dev.click(540, 1770)
+            smart_sleep(1.5, mult)
+            wait_for_network_loading(dev, max_wait=10.0)
+            # الضغط مرتين في أعلى منتصف الشاشة لإغلاق أي نافذة منبثقة
+            dev.click(540, 300)
+            smart_sleep(0.5, mult)
+            dev.click(540, 300)
+            smart_sleep(0.8, mult)
+            return run_account_recovery_flow(dev, req, role, comp_num, emu_key, mult=mult)
+
+        # 10. Continue Exploring ثم سهم الرجوع للبروفايل
+        dev.click(540, 1793)
+        smart_sleep(1.3, mult)
+        wait_for_network_loading(dev, max_wait=8.0)
+
+        dev.click(1019, 91)
+        smart_sleep(1.5, mult)
+        wait_for_network_loading(dev, max_wait=8.0)
+
+        # ====================================================
+        # الرئيسي أو المرافق
+        # ====================================================
+        if role == "leader":
+            leader_id, leader_name = reach_profile_and_extract_id(dev, mult=mult)
+            if not leader_id:
+                raise FlowError("لم يظهر Nusuk ID في المحاكي الأول (الرئيسي)")
+
+            log.info(f"[✓] الرئيسي جاهز: {leader_name} | ID: {leader_id} -> فتح Show All")
+            with _state_lock:
+                STATE["group"] = {
+                    "leader_active": True, "leader_name": leader_name,
+                    "leader_id": leader_id, "companions": [],
+                }
+            save_state()
+
+            ensure_leader_on_friends_page(dev, mult=mult)
+
+            return {
+                "success": True, "status": "leader_registered", "role": "leader",
+                "leader_name": leader_name, "leader_id": leader_id,
+                "message": "تم تسجيل الحساب الرئيسي بنجاح",
+            }
+
+        # ---------------- مسار المرافق ----------------
+        dev2 = dev
+
+        comp_id, comp_name = reach_profile_and_extract_id(dev2, mult=mult)
+        if not comp_id:
+            raise FlowError("لم يظهر Nusuk ID في المحاكي الثاني")
+        log.info(f"التقاط خاطف للمرافق {comp_num}: {comp_id} ({comp_name})")
+
+        dev1 = get_device(EMUS["emu1"]["serial"])
+        open_add_friend_and_send_request(dev1, comp_id, comp_num, mult=mult)
+
+        leader_name = (STATE.get("group") or {}).get("leader_name") or ""
+        dump_dev2 = ""
+        for attempt in range(2):
+            log.info(f"المحاكي الثاني: ريفريش بالخروج ثم الدخول (محاولة {attempt + 1})...")
+            dev2.click(1019, 91)
+            time.sleep(1.0)
+            dev2.click(65, 101)
+            time.sleep(2.0)
+            wait_for_network_loading(dev2, max_wait=10.0)
+
+            dump_dev2 = dev2.dump_hierarchy()
+            if not any(m in dump_dev2 for m in ("عرض الكل", "Show All", "بطاقاتي", "My Cards")) and comp_id not in dump_dev2:
+                dev2.click(65, 101)
+                time.sleep(1.8)
+                wait_for_network_loading(dev2, max_wait=6.0)
+                dump_dev2 = dev2.dump_hierarchy()
+
+            if any(k in dump_dev2 for k in ("قبول", "موافقة", "Accept", "Approve", "طلب", "Request")) or (leader_name and leader_name in dump_dev2):
+                break
+
+        log.info("المحاكي الثاني: النقر على علامة الصح (207, 408) لقبول الطلب...")
+        if not click_text_in_xml(dev2, dump_dev2, ("قبول", "موافقة", "Accept", "Approve"), min_y=250, max_y=650):
+            dev2.click(207, 408)
+        time.sleep(1.5)
+        wait_for_network_loading(dev2, max_wait=8.0)
+
+        with _state_lock:
+            STATE["group"]["companions"].append({"name": comp_name, "id": comp_id})
+            group_count = len(STATE["group"]["companions"])
+        save_state()
+
+        perform_safe_logout(dev2, slow=True)
+        log.info(f"[✓] تم ربط المرافق {comp_num} بنجاح!")
+        bump_counter("emu2")
+
+        if group_count >= MAX_COMPANIONS:
+            if getattr(req, "auto_close_group", True):
+                log.info("اكتملت المجموعة (4 أفراد)! جاري إغلاق مجموعة المحاكي الأول...")
+                close_leader_group(dev1)
+            else:
+                log.info("اكتملت المجموعة (4 أفراد)! تم إبقاء الحساب الرئيسي مفتوحاً للحجز (auto_close_group=False)")
+
+        return {
+            "success": True, "status": "companion_linked", "role": "companion",
+            "companion_name": comp_name, "companion_id": comp_id,
+            "group_count": group_count,
+            "message": f"تم ربط المرافق {comp_num} وقبول الطلب بنجاح",
+        }
+
+    except Exception as e:
+        log.exception(f"[{label}] استثناء أثناء التنفيذ: {e}")
+        shot = save_failure_artifacts(dev, f"{emu_key}_{role}")
+        if dev1 is not None and dev1 is not dev:
+            try:
+                if is_add_friend_dialog_open(dev1):
+                    dev1.press("back")
+            except Exception:
+                pass
+        force_clean_login_state(dev, emu_key)
+        return {"success": False, "status": "error", "error": str(e), "screenshot": shot}
+
+
+
+# ==========================================
+# Endpoints تشفير وفك تشفير الروضة (Rawdah v2)
+# ==========================================
+class RawdahEncryptRequest(BaseModel):
+    payload: Optional[dict] = None
+    key: Optional[str] = None
+    count: int = 1
+    date: str = "2026-11-21"
+    to_date: str = "2026-12-21"
+    date_type: int = 1
+    queue_type: int = 0
+    service_id: int = 1
+    latitude: float = 24.4709
+    longitude: float = 39.6122
+
+
+class RawdahDecryptRequest(BaseModel):
+    data: str
+
+
+@app.post("/api/rawdah/encrypt")
+def rawdah_encrypt_api(req: RawdahEncryptRequest):
+    """تشفير جسم طلب الروضة (POST /rawdah/v2/availableSlotDays)"""
+    try:
+        request_dict = req.payload if req.payload is not None else build_rawdah_request(
+            count=req.count,
+            date=req.date,
+            to_date=req.to_date,
+            date_type=req.date_type,
+            queue_type=req.queue_type,
+            service_id=req.service_id,
+            latitude=req.latitude,
+            longitude=req.longitude,
+        )
+        data, key = encrypt_rawdah(request_dict, key=req.key)
+        return {
+            "success": True,
+            "key": key,
+            "data": data,
+            "body": {"data": data},
+            "request": request_dict,
+        }
+    except Exception as e:
+        log.exception("خطأ في /api/rawdah/encrypt")
+        return {"success": False, "error": str(e)}
+
+
+@app.post("/api/rawdah/decrypt")
+def rawdah_decrypt_api(req: RawdahDecryptRequest):
+    """فك تشفير حقل data لطلبات الروضة"""
+    try:
+        decrypted = decrypt_rawdah(req.data)
+        return {"success": True, "decrypted": decrypted}
+    except Exception as e:
+        log.exception("خطأ في /api/rawdah/decrypt")
+        return {"success": False, "error": str(e)}
+
+
+
+# ==========================================
+# توقيع طلبات Nusuk API + رادار مواعيد الروضة
+# ==========================================
+NUSUK_STATIC_KEY = os.getenv(
+    "NUSUK_STATIC_KEY",
+    "d8b7986b9cd0866f8b53fc0a4b65f503cfce61c66cdef58e214525f1a6de28ce",
+)
+NUSUK_DYNAMIC_KEY = os.getenv(
+    "NUSUK_DYNAMIC_KEY",
+    "2f56343e14b347cf78956a3b4bd13a16a5b1ebe84d83de691b045beab72658f1",
+)
+NUSUK_API_VERSION = os.getenv("NUSUK_API_VERSION", "11")
+NUSUK_DEVICE_ID = os.getenv("NUSUK_DEVICE_ID", "00000000-0000-0000-0000-000000000000")
+NUSUK_BASE_URL = "https://nusukapp.nusuk.sa/nusuk/"
+
+
+def build_nusuk_headers(
+    bearer_token: Optional[str] = None,
+    device_id: Optional[str] = None,
+    lang: str = "ar",
+    version: Optional[str] = None,
+    timestamp: Optional[str] = None,
+    extra_headers: Optional[Dict[str, str]] = None,
+) -> Dict[str, str]:
+    """بناء وتوقيع هيدرز نسك الرسمية (SHA-256 hash + timestamp)."""
+    ts = timestamp or str(int(time.time() * 1000))
+    ver = version or NUSUK_API_VERSION
+    dev_id = device_id or NUSUK_DEVICE_ID
+    h = hashlib.sha256((NUSUK_STATIC_KEY + NUSUK_DYNAMIC_KEY + ts).encode("utf-8")).hexdigest()
+    headers = {
+        "version": ver,
+        "hash": h,
+        "timestamp": ts,
+        "deviceType": "1",
+        "NUSUK_VERSION": ver,
+        "deviceID": dev_id,
+        "x-version": ver,
+        "x-device": dev_id,
+        "os-version": "Android 13 (33)",
+        "Accept": "application/json",
+        "accept-language": lang,
+        "Content-Type": "application/json",
+    }
+    if bearer_token:
+        tok = bearer_token.strip()
+        if not tok.lower().startswith("bearer "):
+            tok = f"Bearer {tok}"
+        headers["Authorization"] = tok
+    if extra_headers:
+        headers.update(extra_headers)
+    return headers
+
+
+def nusuk_http_request(
+    endpoint: str,
+    method: str = "GET",
+    body_dict: Optional[dict] = None,
+    bearer_token: Optional[str] = None,
+    device_id: Optional[str] = None,
+    lang: str = "ar",
+    timeout: int = 25,
+    extra_headers: Optional[Dict[str, str]] = None,
+) -> dict:
+    """إرسال طلب HTTP موقّع لسيرفر نسك وإرجاع النتيجة بشكل منظم."""
+    url = endpoint if endpoint.startswith("http") else (NUSUK_BASE_URL + endpoint.lstrip("/"))
+    headers = build_nusuk_headers(
+        bearer_token=bearer_token,
+        device_id=device_id,
+        lang=lang,
+        extra_headers=extra_headers,
+    )
+    data_bytes = (
+        json.dumps(body_dict, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+        if body_dict is not None
+        else None
+    )
+    req = urllib.request.Request(url, data=data_bytes, headers=headers, method=method.upper())
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            raw = resp.read().decode("utf-8", errors="replace")
+            try:
+                parsed = json.loads(raw)
+            except Exception:
+                parsed = raw
+            return {"ok": True, "http_status": resp.status, "data": parsed}
+    except urllib.error.HTTPError as e:
+        raw = e.read().decode("utf-8", errors="replace")
+        try:
+            parsed = json.loads(raw)
+        except Exception:
+            parsed = raw
+        return {"ok": False, "http_status": e.code, "error": str(e), "data": parsed}
+    except Exception as e:
+        return {"ok": False, "http_status": None, "error": f"{type(e).__name__}: {e}", "data": None}
+
+
+def parse_rawdah_available_slots(api_response: dict) -> list:
+    """استخراج الأيام والفترات المتاحة من استجابة rawdah/v2/availableSlotDays."""
+    if not isinstance(api_response, dict):
+        return []
+    resp = api_response.get("response") or api_response.get("Response") or {}
+    data = resp.get("data") or resp.get("Data") or {}
+    dates = data.get("AvailableDates") or data.get("availableDates") or []
+    summary = []
+    for d in dates:
+        if not isinstance(d, dict):
+            continue
+        intervals = d.get("Intervals") or d.get("intervals") or []
+        slots = []
+        for iv in intervals:
+            for ts in (iv.get("Timeslots") or iv.get("timeslots") or []):
+                slots.append({
+                    "time_ar": ts.get("TimeAr"),
+                    "time_en": ts.get("TimeLa"),
+                    "timeslot_id": ts.get("TimeslotID"),
+                    "percentage": ts.get("Percentage"),
+                    "color": ts.get("PercentageColor"),
+                    "is_instant": ts.get("IsInstant"),
+                    "slot_state": ts.get("SlotState"),
+                    "gender": iv.get("Gender"),
+                })
+        summary.append({
+            "date": d.get("Date"),
+            "percentage": d.get("Percentage"),
+            "color": d.get("PercentageColor"),
+            "slots_count": len(slots),
+            "slots": slots,
+        })
+    return summary
+
+
+# حالة رادار مواعيد الروضة في الخلفية
+_RADAR_LOCK = threading.Lock()
+_RADAR_STOP = threading.Event()
+_RADAR_THREAD: Optional[threading.Thread] = None
+_RADAR_STATE = {
+    "running": False,
+    "started_at": None,
+    "last_check_at": None,
+    "checks_count": 0,
+    "interval_seconds": 15,
+    "config": None,
+    "last_http_status": None,
+    "last_error": None,
+    "available_days": [],
+    "has_open_slots": False,
+}
+
+
+def _rawdah_radar_loop(cfg: dict):
+    log.info("📡 تشغيل رادار مواعيد الروضة (كل %s ثانية)...", cfg["interval_seconds"])
+    while not _RADAR_STOP.is_set():
+        req_dict = build_rawdah_request(
+            count=cfg["count"],
+            date=cfg["date"],
+            to_date=cfg["to_date"],
+            date_type=cfg["date_type"],
+            queue_type=cfg["queue_type"],
+            service_id=cfg["service_id"],
+            latitude=cfg["latitude"],
+            longitude=cfg["longitude"],
+        )
+        enc_data, _ = encrypt_rawdah(req_dict)
+        res = nusuk_http_request(
+            "rawdah/v2/availableSlotDays",
+            method="POST",
+            body_dict={"data": enc_data},
+            bearer_token=cfg.get("bearer_token"),
+            device_id=cfg.get("device_id"),
+            lang=cfg.get("lang", "ar"),
+        )
+        days = parse_rawdah_available_slots(res.get("data")) if res.get("ok") else []
+        open_days = [d for d in days if d.get("slots_count", 0) > 0]
+        with _RADAR_LOCK:
+            _RADAR_STATE["last_check_at"] = datetime.now().isoformat(timespec="seconds")
+            _RADAR_STATE["checks_count"] += 1
+            _RADAR_STATE["last_http_status"] = res.get("http_status")
+            _RADAR_STATE["last_error"] = None if res.get("ok") else res.get("error")
+            _RADAR_STATE["available_days"] = days
+            _RADAR_STATE["has_open_slots"] = len(open_days) > 0
+        if open_days:
+            log.info("🚨 [رادار الروضة] تم رصد %d يوم متاح للحجز!", len(open_days))
+        _RADAR_STOP.wait(cfg["interval_seconds"])
+
+    with _RADAR_LOCK:
+        _RADAR_STATE["running"] = False
+    log.info("🛑 تم إيقاف رادار مواعيد الروضة.")
+
+
+class NusukHeadersRequest(BaseModel):
+    bearer_token: Optional[str] = None
+    device_id: Optional[str] = None
+    lang: str = "ar"
+    version: Optional[str] = None
+
+
+class RawdahSlotsRequest(BaseModel):
+    bearer_token: Optional[str] = None
+    device_id: Optional[str] = None
+    lang: str = "ar"
+    count: int = 1
+    date: str = "2026-11-21"
+    to_date: str = "2026-12-21"
+    date_type: int = 1
+    queue_type: int = 0
+    service_id: int = 1
+    latitude: float = 24.4709
+    longitude: float = 39.6122
+
+
+class RawdahMonitorStartRequest(RawdahSlotsRequest):
+    interval_seconds: int = 15
+
+
+class UmrahDatesRequest(BaseModel):
+    bearer_token: Optional[str] = None
+    device_id: Optional[str] = None
+    lang: str = "ar"
+    citizen_count: int = 1
+    count: int = 1
+    date: str = "2026-11-21"
+    to_date: str = "2026-12-21"
+    date_type: int = 1
+    service_id: int = 1
+
+
+@app.post("/api/nusuk/sign-headers")
+def nusuk_sign_headers_api(req: NusukHeadersRequest):
+    """توليد هيدرز نسك الموقّعة (hash + timestamp) جاهزة لأي طلب."""
+    headers = build_nusuk_headers(
+        bearer_token=req.bearer_token,
+        device_id=req.device_id,
+        lang=req.lang,
+        version=req.version,
+    )
+    return {"success": True, "headers": headers}
+
+
+@app.get("/api/nusuk/server-time")
+def nusuk_server_time_api():
+    """جلب وقت سيرفر نسك الرسمي (lookup/getSystemDateTime) للتحقق من الاتصال وصحة التوقيع."""
+    res = nusuk_http_request("lookup/getSystemDateTime", method="GET")
+    return {"success": res["ok"], **res}
+
+
+@app.post("/api/rawdah/available-slots")
+def rawdah_available_slots_api(req: RawdahSlotsRequest):
+    """استعلام مباشر ومشفّر عن الأيام والفترات المتاحة في الروضة الشريفة."""
+    request_dict = build_rawdah_request(
+        count=req.count,
+        date=req.date,
+        to_date=req.to_date,
+        date_type=req.date_type,
+        queue_type=req.queue_type,
+        service_id=req.service_id,
+        latitude=req.latitude,
+        longitude=req.longitude,
+    )
+    enc_data, _ = encrypt_rawdah(request_dict)
+    res = nusuk_http_request(
+        "rawdah/v2/availableSlotDays",
+        method="POST",
+        body_dict={"data": enc_data},
+        bearer_token=req.bearer_token,
+        device_id=req.device_id,
+        lang=req.lang,
+    )
+    days = parse_rawdah_available_slots(res.get("data")) if res.get("ok") else []
+    return {
+        "success": res["ok"],
+        "http_status": res["http_status"],
+        "available_days": days,
+        "has_open_slots": any(d.get("slots_count", 0) > 0 for d in days),
+        "raw": res.get("data"),
+        "error": res.get("error"),
+    }
+
+
+@app.post("/api/rawdah/monitor/start")
+def rawdah_monitor_start_api(req: RawdahMonitorStartRequest):
+    """تشغيل رادار مواعيد الروضة في الخلفية للفحص التلقائي كل N ثانية."""
+    global _RADAR_THREAD
+    with _RADAR_LOCK:
+        if _RADAR_STATE["running"]:
+            return {"success": False, "message": "الرادار شغال بالفعل، أوقفه أولاً لتعديل الإعدادات"}
+        interval = max(5, min(300, int(req.interval_seconds)))
+        cfg = req.model_dump()
+        cfg["interval_seconds"] = interval
+        _RADAR_STOP.clear()
+        _RADAR_STATE.update({
+            "running": True,
+            "started_at": datetime.now().isoformat(timespec="seconds"),
+            "last_check_at": None,
+            "checks_count": 0,
+            "interval_seconds": interval,
+            "config": {k: v for k, v in cfg.items() if k != "bearer_token"},
+            "last_http_status": None,
+            "last_error": None,
+            "available_days": [],
+            "has_open_slots": False,
+        })
+        _RADAR_THREAD = threading.Thread(target=_rawdah_radar_loop, args=(cfg,), daemon=True)
+        _RADAR_THREAD.start()
+    return {"success": True, "message": f"تم تشغيل رادار الروضة (كل {interval} ثانية)"}
+
+
+@app.post("/api/rawdah/monitor/stop")
+def rawdah_monitor_stop_api():
+    """إيقاف رادار مواعيد الروضة."""
+    _RADAR_STOP.set()
+    return {"success": True, "message": "تم إرسال أمر إيقاف رادار الروضة"}
+
+
+@app.get("/api/rawdah/monitor/status")
+def rawdah_monitor_status_api():
+    """متابعة حالة ونتائج رادار مواعيد الروضة لحظياً."""
+    with _RADAR_LOCK:
+        return {"success": True, **copy.deepcopy(_RADAR_STATE)}
+
+
+@app.post("/api/umrah/available-dates")
+def umrah_available_dates_api(req: UmrahDatesRequest):
+    """استعلام مباشر عن التواريخ المتاحة للعمرة (umrah/availableDates)."""
+    payload = {
+        "Request": {
+            "CitizenCount": req.citizen_count,
+            "Count": req.count,
+            "Date": req.date,
+            "DateType": req.date_type,
+            "ServiceID": req.service_id,
+            "ToDate": req.to_date,
+        }
+    }
+    res = nusuk_http_request(
+        "umrah/availableDates",
+        method="POST",
+        body_dict=payload,
+        bearer_token=req.bearer_token,
+        device_id=req.device_id,
+        lang=req.lang,
+    )
+    return {"success": res["ok"], **res}
+
+
+
+# ==========================================
+# محرك الحجز لأي شخص (عبر المحاكي + عبر الـ API)
+# ==========================================
+BOOKING_INELIGIBLE_KEYS = [
+    "غير مؤهل", "لا يمكنك", "365", "سنة", "تصريح ساري", "لديك تصريح",
+    "لا توجد مواعيد", "غير متاح", "ممتلئ", "اكتمل العدد",
+    "not eligible", "already have", "no available", "fully booked",
+]
+BOOKING_SUCCESS_KEYS = [
+    "تم إصدار التصريح", "تم اصدار التصريح", "تم الحجز بنجاح", "تم تأكيد الحجز",
+    "تصريحك جاهز", "رقم التصريح", "رقم الحجز",
+    "permit issued", "booking confirmed", "successfully booked",
+]
+
+
+def save_booking_screenshot(dev, tag: str) -> Optional[str]:
+    if dev is None:
+        return None
+    try:
+        os.makedirs(BOOKING_SHOTS_DIR, exist_ok=True)
+        fname = f"{datetime.now().strftime('%Y%m%d_%H%M%S')}_{tag}"
+        base = os.path.join(BOOKING_SHOTS_DIR, fname)
+        dev.screenshot(base + ".png")
+        try:
+            with open(base + ".xml", "w", encoding="utf-8") as f:
+                f.write(dev.dump_hierarchy())
+        except Exception:
+            pass
+        files = sorted(
+            (os.path.join(BOOKING_SHOTS_DIR, n) for n in os.listdir(BOOKING_SHOTS_DIR)),
+            key=os.path.getmtime,
+        )
+        for old in files[:-MAX_SHOT_FILES]:
+            try:
+                os.remove(old)
+            except Exception:
+                pass
+        return f"/booking_shots/{fname}.png"
+    except Exception as e:
+        log.warning(f"تعذر حفظ لقطة الحجز: {e}")
+        return None
+
+
+def _click_all_unchecked_boxes(dev, min_y: int = 250, max_y: int = 1650) -> int:
+    """تحديد جميع الـ CheckBoxes غير المحددة في شاشة اختيار الأفراد (الرئيسي + المرافقين)."""
+    clicked = 0
+    try:
+        xml_str = dev.dump_hierarchy()
+        root = ET.fromstring(xml_str.encode("utf-8"))
+        for node in root.iter():
+            cls = node.attrib.get("class") or ""
+            checkable = node.attrib.get("checkable") == "true"
+            checked = node.attrib.get("checked") == "true"
+            if (checkable or "CheckBox" in cls) and not checked:
+                bounds = node.attrib.get("bounds") or ""
+                bm = re.match(r"\[(\d+),(\d+)\]\[(\d+),(\d+)\]", bounds)
+                if bm:
+                    x1, y1, x2, y2 = map(int, bm.groups())
+                    cy = (y1 + y2) // 2
+                    if min_y <= cy <= max_y:
+                        dev.click((x1 + x2) // 2, cy)
+                        clicked += 1
+                        time.sleep(0.25)
+    except Exception:
+        pass
+    return clicked
+
+
+def _click_first_available_timeslot(dev, target_time: Optional[str] = None, min_y: int = 450, max_y: int = 1650) -> Optional[str]:
+    """اختيار الفترة الزمنية المطلوبة أو أول فترة متاحة (بتنسيق ساعة مثل 09:00 أو ص/م)."""
+    xml_str = dev.dump_hierarchy()
+    if target_time:
+        if click_text_in_xml(dev, xml_str, (target_time,), min_y=min_y, max_y=max_y):
+            return target_time
+
+    try:
+        root = ET.fromstring(xml_str.encode("utf-8"))
+        time_re = re.compile(r"\b\d{1,2}:\d{2}\b")
+        for node in root.iter():
+            txt = (node.attrib.get("text") or "").strip()
+            desc = (node.attrib.get("content-desc") or "").strip()
+            combined = f"{txt} {desc}".strip()
+            if not combined:
+                continue
+            if node.attrib.get("enabled") == "false":
+                continue
+            if time_re.search(combined):
+                bounds = node.attrib.get("bounds") or ""
+                bm = re.match(r"\[(\d+),(\d+)\]\[(\d+),(\d+)\]", bounds)
+                if bm:
+                    x1, y1, x2, y2 = map(int, bm.groups())
+                    cy = (y1 + y2) // 2
+                    if min_y <= cy <= max_y:
+                        dev.click((x1 + x2) // 2, cy)
+                        return combined
+    except Exception:
+        pass
+    return None
+
+
+def _is_on_home_screen(xml_str: str) -> bool:
+    clean = strip_arabic_diacritics(xml_str)
+    return any(h in clean for h in ("الروضة", "العمرة", "المحفظة", "حجز تصريح", "Rawdah", "Umrah", "Permits"))
+
+
+def login_existing_account(
+    dev,
+    emu_key: str,
+    email_val: str,
+    password_val: str,
+    client_email: Optional[str] = None,
+    client_pass: Optional[str] = None,
+    mult: float = 1.0,
+) -> dict:
+    """تسجيل دخول لأي حساب نسك موجود بالإيميل وكلمة المرور (+ التقاط OTP تلقائياً لو طُلب)."""
+    label = EMUS[emu_key]["label"]
+    log.info(f"🔑 [{label}] بدء تسجيل الدخول للحساب: {email_val}")
+
+    if not force_clean_login_state(dev, emu_key):
+        raise FlowError(f"[{label}] تعذر الوصول لشاشة تسجيل الدخول قبل تسجيل دخول {email_val}")
+
+    # 1. الوصول لشاشة الدخول بالبريد الإلكتروني (خانتين)
+    edits = None
+    for _ in range(3):
+        cur_edits = dev(className="android.widget.EditText")
+        dump = dev.dump_hierarchy()
+        dump_clean = strip_arabic_diacritics(dump)
+        if len(cur_edits) == 2 and ("تسجيل الدخول" in dump_clean or "عودتك" in dump_clean or "Login" in dump):
+            edits = cur_edits
+            break
+
+        if any(m in dump for m in WELCOME_MARKERS) and "الدخول بواسطة البريد" not in dump_clean:
+            pass_welcome_screen_if_needed(dev, mult=mult)
+            dump = dev.dump_hierarchy()
+            dump_clean = strip_arabic_diacritics(dump)
+
+        if not click_text_in_xml(
+            dev, dump,
+            ("الدخول بواسطة البريد", "البريد الإلكتروني", "تسجيل الدخول بالبريد", "Email", "Continue with Email"),
+            min_y=900, max_y=1850,
+        ):
+            dev.click(796, 1484)
+        smart_sleep(1.2, mult)
+        wait_for_network_loading(dev, max_wait=6.0)
+
+        cur_edits = wait_edits(dev, 2, timeout=4.0 * mult)
+        if cur_edits is not None and len(cur_edits) >= 2:
+            edits = cur_edits
+            break
+
+    if edits is None or len(edits) < 2:
+        shot = save_failure_artifacts(dev, f"{emu_key}_login_form_fail")
+        raise FlowError(f"لم تظهر شاشة إدخال البريد وكلمة المرور (لقطة: {shot})")
+
+    # 2. إدخال الإيميل وكلمة المرور
+    edits[0].set_text(email_val.strip())
+    smart_sleep(0.2, mult)
+    edits[1].set_text(password_val)
+    smart_sleep(0.2, mult)
+    dev.shell("input keyevent 111")
+    smart_sleep(0.4, mult)
+
+    otp_sent_at = time.time()
+    dump_btn = dev.dump_hierarchy()
+    if not click_text_in_xml(dev, dump_btn, ("تسجيل الدخول", "دخول", "متابعة", "Login", "Sign in"), min_y=650, max_y=1850):
+        dev.click(540, 1050)
+
+    smart_sleep(2.0, mult)
+    wait_for_network_loading(dev, max_wait=12.0)
+
+    # 3. التحقق هل ظهرت شاشة OTP أم دخل مباشرة
+    for _ in range(10):
+        dump_after = dev.dump_hierarchy()
+        clean_after = strip_arabic_diacritics(dump_after)
+        if _is_on_home_screen(dump_after):
+            log.info(f"[✓] [{label}] تم تسجيل الدخول بنجاح مباشرة!")
+            return {"success": True, "logged_in": True, "otp_used": False}
+
+        if any(k in clean_after.lower() for k in ("رمز التحقق", "كود التحقق", "verification", "otp", "ادخل الرمز")):
+            if not (client_email and client_pass):
+                shot = save_failure_artifacts(dev, f"{emu_key}_login_otp_required")
+                raise FlowError(f"الحساب طلب كود OTP ولم يتم تمرير client_email/client_pass (لقطة: {shot})")
+            otp = fetch_nusuk_otp(client_email.strip(), client_pass, timeout=55, sent_after=otp_sent_at)
+            if not otp:
+                raise FlowError("لم يتم استلام كود OTP لتسجيل الدخول")
+            dev.click(160, 462)
+            smart_sleep(0.2, mult)
+            dev.shell("input keyevent 67 67 67 67")
+            dev.shell(f"input text {otp}")
+            smart_sleep(0.3, mult)
+            dev.shell("input keyevent 111")
+            smart_sleep(2.0, mult)
+            wait_for_network_loading(dev, max_wait=12.0)
+            for _ in range(3):
+                dev.click(1000, 100)
+                smart_sleep(0.25, mult)
+            log.info(f"[✓] [{label}] تم تسجيل الدخول بنجاح باستخدام OTP!")
+            return {"success": True, "logged_in": True, "otp_used": True}
+
+        if any(err in clean_after.lower() for err in ("خطأ", "غير صحيح", "invalid", "incorrect", "wrong password")):
+            shot = save_failure_artifacts(dev, f"{emu_key}_login_bad_creds")
+            raise FlowError(f"بيانات الدخول غير صحيحة أو مرفوضة من نسك (لقطة: {shot})")
+
+        time.sleep(0.6)
+
+    reopen_nusuk_app(dev, emu_key, mult=mult)
+    return {"success": True, "logged_in": True, "otp_used": False}
+
+
+def book_rawdah_on_emulator(
+    dev,
+    emu_key: str,
+    gender: str = "male",
+    book_all_companions: bool = True,
+    companion_names: Optional[List[str]] = None,
+    target_date: Optional[str] = None,
+    target_time: Optional[str] = None,
+    dry_run: bool = False,
+    mult: float = 1.0,
+) -> dict:
+    """
+    حجز تصريح الروضة الشريفة عبر المحاكي للحساب المفتوح حالياً (فردي أو مجموعة).
+    """
+    label = EMUS[emu_key]["label"]
+    gender_norm = (gender or "male").strip().lower()
+    log.info(
+        f"🕌 [{label}] بدء حجز الروضة | النوع: {gender_norm} | مرافقين: {book_all_companions} | "
+        f"تاريخ: {target_date or 'أقرب متاح'} | وقت: {target_time or 'أقرب متاح'} | dry_run={dry_run}"
+    )
+
+    # 1. التأكد من الوصول للشاشة الرئيسية
+    dump = dev.dump_hierarchy()
+    if not _is_on_home_screen(dump):
+        reopen_nusuk_app(dev, emu_key, mult=mult)
+        dump = dev.dump_hierarchy()
+
+    # 2. فتح قسم الروضة الشريفة
+    opened_rawdah = False
+    for attempt in range(3):
+        dump = dev.dump_hierarchy()
+        if click_text_in_xml(
+            dev, dump,
+            ("الروضة الشريفة", "الروضة", "تصريح الروضة", "Rawdah", "Al-Rawdah", "Praying in the Noble Rawdah"),
+            min_y=150, max_y=1850,
+        ):
+            opened_rawdah = True
+            smart_sleep(1.8, mult)
+            wait_for_network_loading(dev, max_wait=10.0)
+            break
+        # محاولة سحب الشاشة الرئيسية قليلاً لأسفل لو الكرت مخفي
+        dev.swipe(0.5, 0.75, 0.5, 0.35, steps=15)
+        smart_sleep(0.8, mult)
+
+    if not opened_rawdah:
+        shot = save_booking_screenshot(dev, f"{emu_key}_rawdah_entry_not_found")
+        return {"success": False, "status": "entry_not_found", "error": "لم يتم العثور على زر الروضة الشريفة في الشاشة الرئيسية", "screenshot": shot}
+
+    # 3. اختيار النوع (رجال / نساء) أو الضغط على "احجز تصريح" لو ظهرت صفحة هبوط الروضة
+    for _ in range(3):
+        dump_r = dev.dump_hierarchy()
+        clean_r = strip_arabic_diacritics(dump_r).lower()
+
+        if any(k in clean_r for k in BOOKING_INELIGIBLE_KEYS):
+            shot = save_booking_screenshot(dev, f"{emu_key}_rawdah_ineligible")
+            return {"success": False, "status": "ineligible_or_unavailable", "error": "الحساب غير مؤهل حالياً أو لا توجد مواعيد متاحة", "screenshot": shot}
+
+        if any(w in clean_r for w in ("حجز تصريح", "احجز الان", "احجز تصريحك", "book permit", "book now")):
+            click_text_in_xml(dev, dump_r, ("حجز تصريح", "احجز الآن", "احجز تصريحك", "Book Permit", "Book Now"), min_y=200, max_y=1900)
+            smart_sleep(1.5, mult)
+            wait_for_network_loading(dev, max_wait=8.0)
+            dump_r = dev.dump_hierarchy()
+
+        gender_targets = (
+            ("رجال", "الرجال", "روضة - رجال", "Men", "Male")
+            if gender_norm in ("male", "m", "رجال", "ذكر")
+            else ("نساء", "النساء", "روضة - نساء", "Women", "Female")
+        )
+        if click_text_in_xml(dev, dump_r, gender_targets, min_y=200, max_y=1850):
+            smart_sleep(1.5, mult)
+            wait_for_network_loading(dev, max_wait=8.0)
+            break
+        time.sleep(0.6)
+
+    # 4. شاشة اختيار الأفراد (الحساب الرئيسي + المرافقين)
+    dump_p = dev.dump_hierarchy()
+    clean_p = strip_arabic_diacritics(dump_p).lower()
+    if any(k in clean_p for k in ("اختر", "المرافقين", "الافراد", "الزوار", "select", "companions", "visitors", "افراد")):
+        if companion_names:
+            for cname in companion_names:
+                click_text_in_xml(dev, dev.dump_hierarchy(), (cname,), min_y=250, max_y=1650)
+                smart_sleep(0.3, mult)
+        elif book_all_companions:
+            if not click_text_in_xml(dev, dump_p, ("تحديد الكل", "اختيار الكل", "Select All"), min_y=150, max_y=1650):
+                _click_all_unchecked_boxes(dev)
+            smart_sleep(0.5, mult)
+
+        dump_next = dev.dump_hierarchy()
+        click_text_in_xml(dev, dump_next, ("استمرار", "متابعة", "التالي", "Continue", "Next"), min_y=1400, max_y=1900)
+        smart_sleep(1.8, mult)
+        wait_for_network_loading(dev, max_wait=12.0)
+
+    # 5. فحص وجود مواعيد متاحة واختيار اليوم
+    dump_cal = dev.dump_hierarchy()
+    clean_cal = strip_arabic_diacritics(dump_cal).lower()
+    if any(k in clean_cal for k in BOOKING_INELIGIBLE_KEYS):
+        shot = save_booking_screenshot(dev, f"{emu_key}_rawdah_no_dates")
+        return {"success": False, "status": "no_available_dates", "error": "لا توجد أيام متاحة للروضة أو الحساب غير مؤهل", "screenshot": shot}
+
+    selected_date = None
+    if target_date:
+        day_token = target_date.strip().split("-")[-1].lstrip("0") or target_date.strip()
+        if click_text_in_xml(dev, dump_cal, (target_date.strip(), day_token), min_y=250, max_y=1200):
+            selected_date = target_date.strip()
+            smart_sleep(1.2, mult)
+            wait_for_network_loading(dev, max_wait=8.0)
+
+    # 6. اختيار الفترة الزمنية
+    selected_slot = _click_first_available_timeslot(dev, target_time=target_time)
+    if not selected_slot:
+        # سحبة خفيفة لإظهار الفترات أسفل التقويم
+        dev.swipe(0.5, 0.75, 0.5, 0.35, steps=15)
+        smart_sleep(0.8, mult)
+        selected_slot = _click_first_available_timeslot(dev, target_time=target_time)
+
+    if not selected_slot:
+        shot = save_booking_screenshot(dev, f"{emu_key}_rawdah_no_slots")
+        return {
+            "success": False,
+            "status": "no_available_slots",
+            "selected_date": selected_date,
+            "error": "لم يتم العثور على فترات زمنية متاحة في الشاشة الحالية",
+            "screenshot": shot,
+        }
+
+    smart_sleep(0.8, mult)
+
+    # 7. التعليم على مربع الموافقة على الشروط إن وُجد
+    dump_conf = dev.dump_hierarchy()
+    click_text_in_xml(dev, dump_conf, ("أوافق", "اوافق", "الشروط", "التعليمات", "agree", "terms"), min_y=900, max_y=1750)
+    smart_sleep(0.5, mult)
+
+    if dry_run:
+        shot = save_booking_screenshot(dev, f"{emu_key}_rawdah_dry_run")
+        return {
+            "success": True,
+            "status": "dry_run_ready",
+            "selected_date": selected_date,
+            "selected_slot": selected_slot,
+            "message": "تم الوصول لخطوة التأكيد النهائي بنجاح (dry_run=True - لم يتم إصدار التصريح فعلياً)",
+            "screenshot": shot,
+        }
+
+    # 8. الضغط على زر إصدار التصريح / تأكيد الحجز
+    dump_submit = dev.dump_hierarchy()
+    if not click_text_in_xml(
+        dev, dump_submit,
+        ("إصدار التصريح", "اصدار التصريح", "تأكيد الحجز", "تاكيد الحجز", "تأكيد", "Issue Permit", "Confirm Booking", "Confirm"),
+        min_y=1300, max_y=1910,
+    ):
+        dev.click(540, 1790)
+
+    smart_sleep(2.5, mult)
+    wait_for_network_loading(dev, max_wait=15.0)
+
+    # 9. التحقق من نتيجة الحجز وحفظ لقطة شاشة
+    final_xml = dev.dump_hierarchy()
+    final_clean = strip_arabic_diacritics(final_xml).lower()
+    shot = save_booking_screenshot(dev, f"{emu_key}_rawdah_result")
+
+    permit_num_match = re.search(r"\b\d{7,14}\b", final_xml)
+    permit_number = permit_num_match.group(0) if permit_num_match else None
+
+    if any(strip_arabic_diacritics(k).lower() in final_clean for k in BOOKING_SUCCESS_KEYS):
+        log.info(f"🎉 [{label}] تم حجز تصريح الروضة بنجاح! رقم الحجز: {permit_number}")
+        return {
+            "success": True,
+            "status": "booked",
+            "selected_date": selected_date,
+            "selected_slot": selected_slot,
+            "permit_number": permit_number,
+            "screenshot": shot,
+            "message": "تم إصدار تصريح الروضة الشريفة بنجاح!",
+        }
+
+    return {
+        "success": False,
+        "status": "booking_unconfirmed",
+        "selected_date": selected_date,
+        "selected_slot": selected_slot,
+        "screenshot": shot,
+        "message": "تم الضغط على التأكيد لكن لم تظهر رسالة النجاح المتوقعة - راجع لقطة الشاشة",
+    }
+
+
+class EmulatorLoginRequest(BaseModel):
+    emu_key: str = "emu1"
+    email: str
+    password: str
+    client_email: Optional[str] = None
+    client_pass: Optional[str] = None
+    speed_multiplier: Optional[float] = None
+
+
+class EmulatorBookRawdahRequest(BaseModel):
+    emu_key: str = "emu1"
+    gender: str = "male"
+    book_all_companions: bool = True
+    companion_names: Optional[List[str]] = None
+    target_date: Optional[str] = None
+    target_time: Optional[str] = None
+    dry_run: bool = False
+    logout_after: bool = False
+    speed_multiplier: Optional[float] = None
+
+
+class BookForAnyoneRequest(BaseModel):
+    emu_key: str = "emu1"
+    email: Optional[str] = None
+    password: Optional[str] = None
+    client_email: Optional[str] = None
+    client_pass: Optional[str] = None
+    gender: str = "male"
+    book_all_companions: bool = True
+    companion_names: Optional[List[str]] = None
+    target_date: Optional[str] = None
+    target_time: Optional[str] = None
+    dry_run: bool = False
+    logout_after: bool = False
+    speed_multiplier: Optional[float] = None
+
+
+class RawdahIssuePermitAPIRequest(BaseModel):
+    track: str = "external-visitor"  # external-visitor | citizen-resident | instant-track
+    payload: dict
+    encrypt_body: bool = True
+    bearer_token: str
+    device_id: Optional[str] = None
+    lang: str = "ar"
+    extra_headers: Optional[Dict[str, str]] = None
+
+
+class NusukAuthedAPIRequest(BaseModel):
+    bearer_token: str
+    payload: Optional[dict] = None
+    device_id: Optional[str] = None
+    lang: str = "ar"
+    extra_headers: Optional[Dict[str, str]] = None
+
+
+@app.post("/api/book/login")
+def book_login_api(req: EmulatorLoginRequest):
+    """تسجيل دخول لأي حساب موجود على المحاكي المحدد (emu1 أو emu2)."""
+    if req.emu_key not in EMUS:
+        return {"success": False, "error": "اسم المحاكي غير صحيح (emu1 أو emu2)"}
+    with exclusive(LOCK_WAIT) as got:
+        if not got:
+            return BUSY_RESPONSE
+        try:
+            mult = float(req.speed_multiplier or STATE.get("speed_multiplier", 1.0))
+            dev = get_device(EMUS[req.emu_key]["serial"])
+            return login_existing_account(
+                dev, req.emu_key, req.email, req.password,
+                client_email=req.client_email, client_pass=req.client_pass, mult=mult,
+            )
+        except Exception as e:
+            log.exception("خطأ في /api/book/login")
+            return {"success": False, "status": "error", "error": str(e)}
+
+
+@app.post("/api/book/rawdah")
+def book_rawdah_api(req: EmulatorBookRawdahRequest):
+    """حجز الروضة الشريفة عبر المحاكي للحساب المفتوح حالياً (فردي أو مجموعة)."""
+    if req.emu_key not in EMUS:
+        return {"success": False, "error": "اسم المحاكي غير صحيح (emu1 أو emu2)"}
+    with exclusive(LOCK_WAIT) as got:
+        if not got:
+            return BUSY_RESPONSE
+        try:
+            mult = float(req.speed_multiplier or STATE.get("speed_multiplier", 1.0))
+            dev = get_device(EMUS[req.emu_key]["serial"])
+            res = book_rawdah_on_emulator(
+                dev,
+                req.emu_key,
+                gender=req.gender,
+                book_all_companions=req.book_all_companions,
+                companion_names=req.companion_names,
+                target_date=req.target_date,
+                target_time=req.target_time,
+                dry_run=req.dry_run,
+                mult=mult,
+            )
+            if req.logout_after and not req.dry_run:
+                if req.emu_key == "emu1" and STATE["group"]["leader_active"]:
+                    close_leader_group(dev)
+                else:
+                    perform_safe_logout(dev, slow=True)
+            return res
+        except Exception as e:
+            log.exception("خطأ في /api/book/rawdah")
+            return {"success": False, "status": "error", "error": str(e)}
+
+
+@app.post("/api/book/for-anyone")
+def book_for_anyone_api(req: BookForAnyoneRequest):
+    """
+    ميزة الحجز لأي شخص في خطوة واحدة:
+    - لو بعت email + password -> بيسجّل دخول للحساب على المحاكي الأول (أو الثاني) ثم يحجزله الروضة.
+    - لو مبعتش email -> بيحجز مباشرة للحساب/الجروب المفتوح حالياً على المحاكي.
+    """
+    if req.emu_key not in EMUS:
+        return {"success": False, "error": "اسم المحاكي غير صحيح (emu1 أو emu2)"}
+    with exclusive(LOCK_WAIT) as got:
+        if not got:
+            return BUSY_RESPONSE
+        try:
+            mult = float(req.speed_multiplier or STATE.get("speed_multiplier", 1.0))
+            dev = get_device(EMUS[req.emu_key]["serial"])
+            login_info = None
+            if req.email and req.password:
+                login_info = login_existing_account(
+                    dev,
+                    req.emu_key,
+                    req.email,
+                    req.password,
+                    client_email=req.client_email,
+                    client_pass=req.client_pass,
+                    mult=mult,
+                )
+
+            res = book_rawdah_on_emulator(
+                dev,
+                req.emu_key,
+                gender=req.gender,
+                book_all_companions=req.book_all_companions,
+                companion_names=req.companion_names,
+                target_date=req.target_date,
+                target_time=req.target_time,
+                dry_run=req.dry_run,
+                mult=mult,
+            )
+            if login_info:
+                res["login"] = login_info
+
+            if req.logout_after and not req.dry_run:
+                if req.emu_key == "emu1" and STATE["group"]["leader_active"]:
+                    close_leader_group(dev)
+                else:
+                    perform_safe_logout(dev, slow=True)
+            return res
+        except Exception as e:
+            log.exception("خطأ في /api/book/for-anyone")
+            return {"success": False, "status": "error", "error": str(e)}
+
+
+@app.post("/api/rawdah/issue-permit")
+def rawdah_issue_permit_api(req: RawdahIssuePermitAPIRequest):
+    """
+    إرسال طلب إصدار تصريح روضة مباشرة عبر Nusuk API:
+    track = external-visitor | citizen-resident | instant-track
+    """
+    allowed_tracks = {
+        "external-visitor": "rawdah/v2/issuePermit/external-visitor",
+        "citizen-resident": "rawdah/v2/issuePermit/citizen-resident",
+        "instant-track": "rawdah/v2/issuePermit/instant-track",
+    }
+    ep = allowed_tracks.get(req.track.strip().lower())
+    if not ep:
+        return {"success": False, "error": f"track غير مدعوم. المتاح: {list(allowed_tracks.keys())}"}
+    body = req.payload
+    if req.encrypt_body:
+        enc_data, _ = encrypt_rawdah(req.payload)
+        body = {"data": enc_data}
+    res = nusuk_http_request(
+        ep,
+        method="POST",
+        body_dict=body,
+        bearer_token=req.bearer_token,
+        device_id=req.device_id,
+        lang=req.lang,
+        extra_headers=req.extra_headers,
+    )
+    return {"success": res["ok"], "endpoint": ep, **res}
+
+
+@app.post("/api/rawdah/permits")
+def rawdah_get_permits_api(req: NusukAuthedAPIRequest):
+    """جلب تصاريح الروضة السابقة والحالية لحساب مباشرة عبر API (rawdah/v2/getRawdahPermits)."""
+    res = nusuk_http_request(
+        "rawdah/v2/getRawdahPermits",
+        method="POST",
+        body_dict=req.payload or {},
+        bearer_token=req.bearer_token,
+        device_id=req.device_id,
+        lang=req.lang,
+        extra_headers=req.extra_headers,
+    )
+    return {"success": res["ok"], **res}
+
+
+@app.post("/api/rawdah/confirm-permit")
+def rawdah_confirm_permit_api(req: NusukAuthedAPIRequest):
+    """تأكيد تصريح روضة عبر API (rawdah/v2/confirmPermit)."""
+    res = nusuk_http_request(
+        "rawdah/v2/confirmPermit",
+        method="POST",
+        body_dict=req.payload or {},
+        bearer_token=req.bearer_token,
+        device_id=req.device_id,
+        lang=req.lang,
+        extra_headers=req.extra_headers,
+    )
+    return {"success": res["ok"], **res}
+
+
+@app.post("/api/rawdah/cancel-permit")
+def rawdah_cancel_permit_api(req: NusukAuthedAPIRequest):
+    """إلغاء تصريح روضة عبر API (rawdah/v2/cancelPermit)."""
+    res = nusuk_http_request(
+        "rawdah/v2/cancelPermit",
+        method="POST",
+        body_dict=req.payload or {},
+        bearer_token=req.bearer_token,
+        device_id=req.device_id,
+        lang=req.lang,
+        extra_headers=req.extra_headers,
+    )
+    return {"success": res["ok"], **res}
+
+
+@app.post("/api/umrah/issue-permit")
+def umrah_issue_permit_api(req: NusukAuthedAPIRequest):
+    """إصدار تصريح عمرة عبر API (umrah/issuePermit)."""
+    res = nusuk_http_request(
+        "umrah/issuePermit",
+        method="POST",
+        body_dict=req.payload or {},
+        bearer_token=req.bearer_token,
+        device_id=req.device_id,
+        lang=req.lang,
+        extra_headers=req.extra_headers,
+    )
+    return {"success": res["ok"], **res}
+
+
+if __name__ == "__main__":
+    import uvicorn
+
+    log.info(f"تشغيل السيرفر على {HOST}:{PORT} | Origins: {ALLOWED_ORIGINS}")
+    uvicorn.run(app, host=HOST, port=PORT)

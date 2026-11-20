@@ -37,5 +37,11 @@ export const DEFAULT_SETTINGS = {
   pollingEnabled: true,
 };
 
+export const DEFAULT_NUSUK_API_CONFIG = {
+  bearerToken: '',
+  deviceId: '',
+  lang: 'ar',
+};
+
 export const FINGERPRINT_LIMIT = 5;
 export const POLLING_INTERVAL_MS = 3000;

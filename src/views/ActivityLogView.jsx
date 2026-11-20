@@ -21,7 +21,7 @@ const FILTERS = [
   { id: 'success', label: 'ناجح' },
   { id: 'ineligible', label: 'غير مؤهل للروضة' },
   { id: 'error', label: 'أخطاء' },
-  { id: 'screenshots', label: 'بها لقطة خطأ' },
+  { id: 'screenshots', label: 'بها لقطة شاشة' },
 ];
 
 export default function ActivityLogView({
@@ -167,6 +167,7 @@ export default function ActivityLogView({
             const badge = getBadge(entry.outcome);
             const BadgeIcon = badge.Icon;
             const shotUrl = entry.screenshot ? buildAssetUrl(apiBaseUrl, entry.screenshot) : null;
+            const isBookingShot = Boolean(entry.screenshot && String(entry.screenshot).includes('booking_shots'));
             const expanded = Boolean(expandedIds[entry.id]);
 
             return (
@@ -193,9 +194,15 @@ export default function ActivityLogView({
                         </code>
                       )}
                       {shotUrl && (
-                        <span className="inline-flex items-center gap-1 text-[11px] font-bold px-2 py-0.5 rounded-md bg-rose-500/15 text-rose-300 border border-rose-500/30">
+                        <span
+                          className={`inline-flex items-center gap-1 text-[11px] font-bold px-2 py-0.5 rounded-md border ${
+                            isBookingShot
+                              ? 'bg-emerald-500/15 text-emerald-300 border-emerald-500/30'
+                              : 'bg-rose-500/15 text-rose-300 border-rose-500/30'
+                          }`}
+                        >
                           <ImageIcon className="w-3 h-3" />
-                          <span>لقطة خطأ</span>
+                          <span>{isBookingShot ? 'لقطة حجز' : 'لقطة خطأ'}</span>
                         </span>
                       )}
                     </div>
@@ -223,9 +230,13 @@ export default function ActivityLogView({
                   </div>
                 </div>
 
-                {/* Inline Failure Screenshot Preview */}
+                {/* Inline Screenshot Preview (Booking / Failure) */}
                 {shotUrl && (
-                  <div className="rounded-xl border border-rose-500/30 bg-slate-950/75 p-3.5 flex flex-col sm:flex-row items-start sm:items-center gap-4">
+                  <div
+                    className={`rounded-xl border bg-slate-950/75 p-3.5 flex flex-col sm:flex-row items-start sm:items-center gap-4 ${
+                      isBookingShot ? 'border-emerald-500/30' : 'border-rose-500/30'
+                    }`}
+                  >
                     <button
                       type="button"
                       onClick={() =>
@@ -249,7 +260,9 @@ export default function ActivityLogView({
                     </button>
 
                     <div className="space-y-2 min-w-0">
-                      <p className="text-xs font-bold text-rose-300">لقطة شاشة المحاكي عند وقوع الخطأ</p>
+                      <p className={`text-xs font-bold ${isBookingShot ? 'text-emerald-300' : 'text-rose-300'}`}>
+                        {isBookingShot ? 'لقطة شاشة الحجز من المحاكي' : 'لقطة شاشة المحاكي عند وقوع الخطأ'}
+                      </p>
                       <p className="text-[11px] font-mono text-slate-400 break-all" dir="ltr">
                         {shotUrl}
                       </p>
@@ -262,7 +275,11 @@ export default function ActivityLogView({
                             subtitle: entry.message,
                           })
                         }
-                        className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-bold bg-rose-500/20 hover:bg-rose-500/30 text-rose-200 border border-rose-500/35 transition-colors"
+                        className={`inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-bold border transition-colors ${
+                          isBookingShot
+                            ? 'bg-emerald-500/20 hover:bg-emerald-500/30 text-emerald-200 border-emerald-500/35'
+                            : 'bg-rose-500/20 hover:bg-rose-500/30 text-rose-200 border-rose-500/35'
+                        }`}
                       >
                         <ZoomIn className="w-3.5 h-3.5" />
                         <span>تكبير الصورة في نافذة مستقلة</span>

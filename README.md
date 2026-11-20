@@ -1,6 +1,6 @@
-# لوحة تحكم نُسُك برو | Nusuk Dual-Emulator Pro Dashboard
+# لوحة تحكم نُسُك برو v2 | Nusuk Dual-Emulator Pro Dashboard
 
-لوحة تحكم عربية متكاملة (RTL — Dark Mode) مبنية بـ **React + Vite + Tailwind CSS + Lucide Icons** للتحكم الكامل في محرك تسجيل المعتمرين المزدوج `server_merged.py` (**FastAPI + LDPlayer + uiautomator2**).
+لوحة تحكم عربية متكاملة (**RTL — Dark Mode**) مبنية بـ **React + Vite + Tailwind CSS + Lucide Icons** للتحكم الكامل في محرك نُسُك المحدث `backend/server_pro_v2.py` (**FastAPI + LDPlayer + uiautomator2 + Nusuk Signed API + Rawdah Radar**).
 
 ---
 
@@ -15,18 +15,33 @@
 2. **مركز تسجيل المعتمرين واسترجاع الحسابات (`POST /api/register` و `POST /api/recover`):**
    - إدخال فردي سريع مع قائمة جنسيات قابلة للبحث والكتابة الحرة واختيار الدور (`تلقائي` / `leader` / `companion`).
    - **إدخال جماعي (Bulk Queue / Excel & CSV):** لصق مباشر من Excel أو رفع ملف CSV لتنفيذ القائمة بالتتابع مع إيقاف مؤقت وإعادة محاولة الفاشل وتصدير النتائج CSV متوافق مع العربية.
-   - عرض بطاقة فحص أحقية تصريح الروضة (`eligible`, `reason`, `details`) بألوان واضحة (أخضر للمؤهل / أحمر لغير المؤهل).
+   - خيارات متقدمة مدمجة في الإدخال الفردي والطابور الجماعي:
+     - `auto_close_group`: إغلاق وخروج الحساب الرئيسي تلقائياً بعد اكتمال 4 أفراد (أو إيقافه لإبقاء الجروب مفتوحاً للحجز المباشر).
+     - `skip_permit_check`: تخطي فحص التصاريح السابقة يدوياً عند الاسترجاع.
+   - عرض بطاقة فحص أحقية تصريح الروضة (`eligible`, `reason`, `details`) بألوان واضحة.
 
-3. **مراقبة صحة المحاكيات والتحكم بها (`GET /api/health` و `POST /api/randomize-emulator`):**
-   - بطاقات مستقلة لـ `emu1` (الرئيسي) و `emu2` (المرافق) تعرض الاتصال، أبعاد الشاشة، التطبيق المفتوح حالياً، وهل تطبيق نسك في الواجهة.
-   - زر تغيير البصمة وإعادة التشغيل لكل محاكي مع نافذة تأكيد.
+3. **محرك الحجز لأي حد (`POST /api/book/rawdah` و `POST /api/book/for-anyone` و `POST /api/book/login`):**
+   - الحجز المباشر للحساب/الجروب المفتوح حالياً على المحاكي، أو الحجز لأي شخص جديد في خطوة واحدة (مع تسجيل دخول تلقائي والتقاط OTP).
+   - زر مستقل لتسجيل الدخول فقط (`POST /api/book/login`).
+   - خيارات اختيار المحاكي (`emu1`/`emu2`)، النوع (`male`/`female`)، تحديد الكل (`book_all_companions`) أو أسماء مرافقين محددين (`companion_names`)، التاريخ والوقت الاختياريين، خيار الأمان التجريبي (`dry_run`)، وخيار تسجيل الخروج بعد الحجز (`logout_after`).
+   - بطاقة نتيجة تعرض الحالة، التاريخ والوقت المختار، رقم التصريح مع زر نسخ، ولقطة شاشة الحجز (`/booking_shots/*.png`) مع تكبير في Modal وتسجيلها في سجل العمليات.
 
-4. **مختبر تشفير الروضة (`POST /api/rawdah/encrypt` و `POST /api/rawdah/decrypt`):**
-   - تشفير طلبات `Rawdah v2` عبر الحقول الجاهزة أو JSON مخصص، مع نسخ `JSON` و `cURL` بضغطة زر.
-   - فك التشفير وعرض الناتج كـ Pretty JSON مع استخراج المفتاح.
+4. **رادار الروضة والمواعيد الحية ومواعيد العمرة:**
+   - شريط إعدادات Nusuk API (`Bearer Token`, `Device ID`, `lang`) محفوظ في `localStorage` مع فحص وقت سيرفر نسك (`GET /api/nusuk/server-time`) وتوليد هيدرز موقّعة (`POST /api/nusuk/sign-headers`).
+   - تشغيل وإيقاف رادار الروضة التلقائي في الخلفية (`POST /api/rawdah/monitor/start` و `POST /api/rawdah/monitor/stop`) مع Polling كل 3 ثوانٍ (`GET /api/rawdah/monitor/status`) وفحص فوري لمرة واحدة (`POST /api/rawdah/available-slots`).
+   - عرض الأيام والفترات المتاحة (`available_days`) بكروت مرتبة مع نسب الإتاحة والألوان والفترات الفورية وزر انتقال مباشر للحجز.
+   - تنبيه صوتي فوري (Web Audio API بدون ملفات خارجية) + بانر أخضر بارز + Browser Notification عند فتح أي مواعيد.
+   - قسم مخصص لاستعلام مواعيد العمرة المتاحة (`POST /api/umrah/available-dates`).
 
-5. **سجل العمليات ولقطات الأخطاء:**
-   - تتبع كل العمليات خلال الجلسة وعرض صور الأخطاء (`fail_shots/*.png`) مباشرة داخل الداشبورد مع نافذة تكبير.
+5. **مراقبة صحة المحاكيات والتحكم بها (`GET /api/health` و `POST /api/randomize-emulator`):**
+   - بطاقات مستقلة لـ `emu1` و `emu2` تعرض الاتصال، أبعاد الشاشة، التطبيق المفتوح حالياً، وزر تغيير البصمة وإعادة التشغيل.
+
+6. **أدوات الروضة والـ API (Crypto Lab & Direct Permits API):**
+   - تشفير وفك تشفير طلبات `Rawdah v2` (`AES-128-CBC`) مع نسخ `JSON` و `cURL`.
+   - قسم إدارة التصاريح المباشرة عبر API: جلب تصاريح الروضة (`POST /api/rawdah/permits`)، إصدار تصريح روضة (`POST /api/rawdah/issue-permit` لمسارات `external-visitor` / `citizen-resident` / `instant-track` مع خيار `encrypt_body`)، تأكيد تصريح (`POST /api/rawdah/confirm-permit`)، إلغاء تصريح (`POST /api/rawdah/cancel-permit`)، وإصدار تصريح عمرة (`POST /api/umrah/issue-permit`) مع دعم `extra_headers`.
+
+7. **سجل العمليات ولقطات الشاشة:**
+   - تتبع كل العمليات خلال الجلسة واستعراض صور الحجز (`booking_shots/*.png`) ولقطات الأخطاء (`fail_shots/*.png`) مباشرة داخل الداشبورد مع نافذة تكبير.
 
 ---
 
@@ -35,7 +50,7 @@
 ```text
 .
 ├── backend/
-│   ├── server_merged.py       # سيرفر FastAPI ومحرك المحاكيات المزدوج
+│   ├── server_pro_v2.py       # السيرفر الأساسي: FastAPI + المحاكيات + رادار الروضة + محرك الحجز + Nusuk API
 │   ├── requirements.txt       # حزم بايثون المطلوبة
 │   └── .env.example           # نموذج متغيرات البيئة
 ├── src/                       # كود الواجهة الأمامية (React + Tailwind CSS)
@@ -66,16 +81,16 @@ pip install -r requirements.txt
 copy .env.example .env
 ```
 
-ثم شغّل السيرفر باستخدام `uvicorn`:
+ثم شغّل السيرفر الأساسي مباشرة عبر Python:
 
 ```bash
-uvicorn server_merged:app --host 127.0.0.1 --port 8000
+python server_pro_v2.py
 ```
 
-أو مباشرة عبر Python:
+أو باستخدام `uvicorn`:
 
 ```bash
-python server_merged.py
+uvicorn server_pro_v2:app --host 127.0.0.1 --port 8000
 ```
 
 ---
@@ -85,7 +100,7 @@ python server_merged.py
 1. افتح رابط الداشبورد (عبر **GitHub Pages** أو محلياً).
 2. انتقل إلى تبويب **إعدادات الاتصال** (`Settings`):
    - **عنوان السيرفر (API Base URL):** اتركه `http://127.0.0.1:8000` إذا كان السيرفر يعمل على نفس الجهاز، ثم اضغط **اختبار الاتصال**.
-   - **إيميل استلام الـ OTP (`client_email`) وكلمة مرور التطبيق (`client_pass`):** أدخل بريد Gmail و App Password ليُحفظ محلياً في المتصفح (`localStorage`) ولا تحتاج لإعادة إدخالهما مع كل طلب.
+   - **إيميل استلام الـ OTP (`client_email`) وكلمة مرور التطبيق (`client_pass`):** أدخل بريد Gmail و App Password ليُحفظ محلياً في المتصفح (`localStorage`).
    - اضبط كلمة المرور الافتراضية والجنسية الافتراضية ثم اضغط **حفظ الإعدادات**.
 
 > **ملاحظة حول الاتصال من GitHub Pages (HTTPS):**
@@ -109,7 +124,7 @@ npm run build
 
 ---
 
-## ملخص نقاط النهاية المدعومة (API Endpoints)
+## ملخص نقاط النهاية المدعومة (`server_pro_v2.py`)
 
 | الطريقة | المسار | الوظيفة |
 | :--- | :--- | :--- |
@@ -119,8 +134,24 @@ npm run build
 | `POST` | `/api/reset-state?reset_counters=...` | تصفير المجموعة وحالة السلامة (مع خيار تصفير العدادات) |
 | `POST` | `/api/randomize-emulator?emu_key=...` | تغيير البصمة وإعادة تشغيل محاكي محدد |
 | `POST` | `/api/force-close-group` | إنهاء المجموعة النشطة وتسجيل خروج الحساب الرئيسي |
-| `POST` | `/api/register` | تسجيل معتمر جديد (مع التحويل التلقائي للاسترجاع إذا كان مسجلاً مسبقاً) |
+| `POST` | `/api/register` | تسجيل معتمر جديد (يدعم `auto_close_group` و `skip_permit_check`) |
 | `POST` | `/api/recover` | استرجاع حساب وفحص أحقية تصريح الروضة الشريفة |
+| `POST` | `/api/book/login` | تسجيل دخول حساب نسك موجود على المحاكي |
+| `POST` | `/api/book/rawdah` | حجز الروضة للحساب أو الجروب المفتوح حالياً (يدعم `dry_run` و `logout_after`) |
+| `POST` | `/api/book/for-anyone` | تسجيل الدخول وحجز الروضة لأي شخص في خطوة واحدة |
+| `GET` | `/api/nusuk/server-time` | جلب وقت سيرفر نسك الرسمي للتحقق من الاتصال والتوقيع |
+| `POST` | `/api/nusuk/sign-headers` | توليد هيدرز نسك الموقّعة (`hash` + `timestamp`) |
+| `POST` | `/api/rawdah/available-slots` | فحص فوري مشفّر للأيام والفترات المتاحة في الروضة |
+| `POST` | `/api/rawdah/monitor/start` | تشغيل رادار الروضة التلقائي في الخلفية |
+| `POST` | `/api/rawdah/monitor/stop` | إيقاف رادار الروضة |
+| `GET` | `/api/rawdah/monitor/status` | جلب حالة ونتائج رادار الروضة لحظياً |
+| `POST` | `/api/umrah/available-dates` | استعلام مباشر عن التواريخ المتاحة للعمرة |
 | `POST` | `/api/rawdah/encrypt` | تشفير طلب الروضة (AES-128-CBC) |
 | `POST` | `/api/rawdah/decrypt` | فك تشفير حقل `data` لطلبات الروضة |
+| `POST` | `/api/rawdah/permits` | جلب تصاريح الروضة مباشرة عبر API |
+| `POST` | `/api/rawdah/issue-permit` | إصدار تصريح روضة مباشر عبر API (`external-visitor` / `citizen-resident` / `instant-track`) |
+| `POST` | `/api/rawdah/confirm-permit` | تأكيد تصريح روضة عبر API |
+| `POST` | `/api/rawdah/cancel-permit` | إلغاء تصريح روضة عبر API |
+| `POST` | `/api/umrah/issue-permit` | إصدار تصريح عمرة عبر API |
+| `GET` | `/booking_shots/{file}.png` | عرض لقطات شاشة الحجز المحفوظة من المحاكي |
 | `GET` | `/fail_shots/{file}.png` | عرض لقطات شاشة الأخطاء المحفوظة من المحاكي |

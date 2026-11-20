@@ -2,6 +2,8 @@ import React from 'react';
 import {
   LayoutDashboard,
   UserPlus,
+  CalendarCheck2,
+  Radar,
   Smartphone,
   Lock,
   ScrollText,
@@ -14,9 +16,11 @@ import {
 const NAV_ITEMS = [
   { id: 'overview', label: 'لوحة المتابعة والمجموعة', icon: LayoutDashboard },
   { id: 'register', label: 'التسجيل والاسترجاع', icon: UserPlus },
+  { id: 'booking', label: 'الحجز لأي حد', icon: CalendarCheck2 },
+  { id: 'radar', label: 'رادار الروضة والمواعيد', icon: Radar },
   { id: 'health', label: 'صحة المحاكيات', icon: Smartphone },
-  { id: 'crypto', label: 'مختبر تشفير الروضة', icon: Lock },
-  { id: 'logs', label: 'السجل ولقطات الأخطاء', icon: ScrollText },
+  { id: 'crypto', label: 'أدوات الروضة والـ API', icon: Lock },
+  { id: 'logs', label: 'السجل ولقطات الشاشة', icon: ScrollText },
   { id: 'settings', label: 'إعدادات الاتصال', icon: Settings },
 ];
 
@@ -26,6 +30,7 @@ export default function Sidebar({
   mobileOpen,
   onCloseMobile,
   statusData,
+  radarStatus,
   logsCount,
   screenshotsCount,
   queueRunning,
@@ -33,6 +38,8 @@ export default function Sidebar({
 }) {
   const emuIssue =
     statusData?.health?.emu1?.ok === false || statusData?.health?.emu2?.ok === false;
+  const radarRunning = Boolean(radarStatus?.running);
+  const radarHasOpen = Boolean(radarStatus?.has_open_slots);
 
   const renderBadge = (id) => {
     if (id === 'overview' && statusData?.leader_active) {
@@ -50,6 +57,23 @@ export default function Sidebar({
         </span>
       );
     }
+    if (id === 'radar') {
+      if (radarHasOpen) {
+        return (
+          <span className="flex items-center gap-1 px-2 py-0.5 rounded-full text-[11px] font-extrabold bg-emerald-500 text-slate-950 animate-pulse">
+            مفتوح!
+          </span>
+        );
+      }
+      if (radarRunning) {
+        return (
+          <span className="flex items-center gap-1 px-2 py-0.5 rounded-full text-[11px] font-bold bg-emerald-500/20 text-emerald-300 border border-emerald-500/35">
+            <Radio className="w-3 h-3 animate-pulse" />
+            شغّال
+          </span>
+        );
+      }
+    }
     if (id === 'health' && emuIssue) {
       return (
         <span className="px-1.5 py-0.5 rounded-full text-[11px] font-bold bg-rose-500/20 text-rose-300 border border-rose-500/30">
@@ -61,7 +85,7 @@ export default function Sidebar({
       return (
         <span className="flex items-center gap-1">
           {screenshotsCount > 0 && (
-            <span className="px-1.5 py-0.5 rounded-full text-[10px] font-bold bg-rose-500/20 text-rose-300 tabular-nums">
+            <span className="px-1.5 py-0.5 rounded-full text-[10px] font-bold bg-emerald-500/20 text-emerald-300 tabular-nums">
               {screenshotsCount} صور
             </span>
           )}
@@ -103,9 +127,9 @@ export default function Sidebar({
           </div>
           <div className="min-w-0">
             <h1 className="text-base font-extrabold text-white tracking-tight truncate">
-              نُسُك برو <span className="text-emerald-400">Engine</span>
+              نُسُك برو <span className="text-emerald-400">v2</span>
             </h1>
-            <p className="text-[11px] text-slate-400 truncate">نظام التحكم المزدوج بالمحاكيات</p>
+            <p className="text-[11px] text-slate-400 truncate">نظام المحاكيات والرادار والحجز</p>
           </div>
         </div>
         <button

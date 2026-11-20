@@ -26,6 +26,7 @@ import {
 } from 'lucide-react';
 import NationalityCombobox from '../components/NationalityCombobox';
 import RawdahEligibilityCard from '../components/RawdahEligibilityCard';
+import ToggleSwitch from '../components/ToggleSwitch';
 import { parseBulkInput, exportQueueToCsv } from '../utils/bulkParser';
 import { buildAssetUrl } from '../services/api';
 
@@ -93,6 +94,8 @@ export default function RegistrationView({
   const [pilgrimEmail, setPilgrimEmail] = useState('');
   const [pilgrimPassword, setPilgrimPassword] = useState('');
   const [forceRole, setForceRole] = useState('');
+  const [autoCloseGroup, setAutoCloseGroup] = useState(true);
+  const [skipPermitCheck, setSkipPermitCheck] = useState(false);
 
   // Bulk paste text
   const [pasteText, setPasteText] = useState('');
@@ -133,6 +136,8 @@ export default function RegistrationView({
       email: pilgrimEmail.trim(),
       password: pilgrimPassword.trim(),
       forceRole: forceRole || null,
+      autoCloseGroup,
+      skipPermitCheck,
     });
 
     if (res?.success) {
@@ -202,7 +207,15 @@ export default function RegistrationView({
     );
   };
 
-  const { items: queueItems, running: queueRunning, paused: queuePaused, mode: queueMode, forceRole: queueRole } = bulkState;
+  const {
+    items: queueItems,
+    running: queueRunning,
+    paused: queuePaused,
+    mode: queueMode,
+    forceRole: queueRole,
+    autoCloseGroup: queueAutoCloseGroup = true,
+    skipPermitCheck: queueSkipPermitCheck = false,
+  } = bulkState;
   const stats = {
     total: queueItems.length,
     pending: queueItems.filter((i) => i.status === 'pending').length,
@@ -414,6 +427,44 @@ export default function RegistrationView({
               </div>
             </div>
 
+            {/* Extra v2 Switches: auto_close_group & skip_permit_check */}
+            <div className="grid grid-cols-1 sm:grid-cols-2 gap-3 pt-1">
+              <div className="rounded-xl border border-slate-800 bg-slate-950/60 px-3.5 py-3 flex items-center justify-between gap-3">
+                <div className="min-w-0">
+                  <span className="text-xs font-bold text-slate-200 block">
+                    إغلاق الجروب تلقائياً (<code className="font-mono text-emerald-400">auto_close_group</code>)
+                  </span>
+                  <span className="text-[11px] text-slate-400 block mt-0.5 leading-snug">
+                    خروج الرئيسي تلقائياً بعد اكتمال 4 أفراد — أوقفه لإبقائه مفتوحاً للحجز المباشر
+                  </span>
+                </div>
+                <ToggleSwitch
+                  checked={autoCloseGroup}
+                  onChange={setAutoCloseGroup}
+                  disabled={isSingleBusy}
+                  ariaLabel="إغلاق المجموعة تلقائياً"
+                />
+              </div>
+
+              <div className="rounded-xl border border-slate-800 bg-slate-950/60 px-3.5 py-3 flex items-center justify-between gap-3">
+                <div className="min-w-0">
+                  <span className="text-xs font-bold text-slate-200 block">
+                    تخطي فحص التصاريح (<code className="font-mono text-amber-300">skip_permit_check</code>)
+                  </span>
+                  <span className="text-[11px] text-slate-400 block mt-0.5 leading-snug">
+                    تخطي فحص تصاريح الروضة السابقة يدوياً أثناء الاسترجاع
+                  </span>
+                </div>
+                <ToggleSwitch
+                  checked={skipPermitCheck}
+                  onChange={setSkipPermitCheck}
+                  disabled={isSingleBusy}
+                  accent="amber"
+                  ariaLabel="تخطي فحص التصاريح السابقة"
+                />
+              </div>
+            </div>
+
             {/* Action buttons */}
             <div className="grid grid-cols-1 sm:grid-cols-2 gap-3 pt-3 border-t border-slate-800/80">
               <button
@@ -571,6 +622,44 @@ export default function RegistrationView({
                 <Plus className="w-4 h-4" />
                 <span>إضافة للطابور</span>
               </button>
+            </div>
+
+            {/* Bulk Queue v2 Switches */}
+            <div className="grid grid-cols-1 md:grid-cols-2 gap-3 pt-2 border-t border-slate-800/80">
+              <div className="rounded-xl border border-slate-800 bg-slate-950/60 px-3.5 py-2.5 flex items-center justify-between gap-3">
+                <div className="min-w-0">
+                  <span className="text-xs font-bold text-slate-200 block">
+                    إغلاق الجروب تلقائياً (<code className="font-mono text-emerald-400">auto_close_group</code>)
+                  </span>
+                  <span className="text-[11px] text-slate-400 block mt-0.5">
+                    إغلاق وخروج الحساب الرئيسي بعد اكتمال 4 أفراد (أوقفه لإبقاء الجروب مفتوحاً للحجز)
+                  </span>
+                </div>
+                <ToggleSwitch
+                  checked={queueAutoCloseGroup}
+                  onChange={(val) => onChangeBulkConfig({ autoCloseGroup: val })}
+                  disabled={queueRunning}
+                  ariaLabel="إغلاق الجروب تلقائياً في الطابور"
+                />
+              </div>
+
+              <div className="rounded-xl border border-slate-800 bg-slate-950/60 px-3.5 py-2.5 flex items-center justify-between gap-3">
+                <div className="min-w-0">
+                  <span className="text-xs font-bold text-slate-200 block">
+                    تخطي فحص التصاريح (<code className="font-mono text-amber-300">skip_permit_check</code>)
+                  </span>
+                  <span className="text-[11px] text-slate-400 block mt-0.5">
+                    تخطي فحص التصاريح السابقة يدوياً عند الاسترجاع داخل الطابور
+                  </span>
+                </div>
+                <ToggleSwitch
+                  checked={queueSkipPermitCheck}
+                  onChange={(val) => onChangeBulkConfig({ skipPermitCheck: val })}
+                  disabled={queueRunning}
+                  accent="amber"
+                  ariaLabel="تخطي فحص التصاريح في الطابور"
+                />
+              </div>
             </div>
           </section>
 

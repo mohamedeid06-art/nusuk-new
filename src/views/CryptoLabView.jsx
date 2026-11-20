@@ -12,7 +12,19 @@ import {
   ArrowLeftRight,
   Braces,
   AlertCircle,
+  Send,
+  FileCheck2,
+  CheckCircle2,
+  XCircle,
+  Ban,
+  ListChecks,
+  Eye,
+  EyeOff,
+  Globe,
+  Smartphone,
+  ShieldCheck,
 } from 'lucide-react';
+import ToggleSwitch from '../components/ToggleSwitch';
 
 const DEFAULT_CUSTOM_JSON = JSON.stringify(
   {
@@ -33,6 +45,103 @@ const DEFAULT_CUSTOM_JSON = JSON.stringify(
   2
 );
 
+const DIRECT_OPERATIONS = [
+  {
+    id: 'permits',
+    label: 'جلب تصاريح الروضة',
+    short: 'جلب التصاريح',
+    endpoint: 'POST /api/rawdah/permits',
+    desc: 'جلب تصاريح الروضة السابقة والحالية لحساب عبر rawdah/v2/getRawdahPermits',
+    icon: ListChecks,
+    accent: 'emerald',
+    defaultPayload: JSON.stringify({}, null, 2),
+  },
+  {
+    id: 'issue-rawdah',
+    label: 'إصدار تصريح روضة مباشر',
+    short: 'إصدار روضة',
+    endpoint: 'POST /api/rawdah/issue-permit',
+    desc: 'إصدار تصريح روضة عبر external-visitor أو citizen-resident أو instant-track مع خيار التشفير',
+    icon: Sparkles,
+    accent: 'emerald',
+    defaultPayload: JSON.stringify(
+      {
+        Request: {
+          TimeslotID: 0,
+          Date: '2026-11-21',
+          ServiceID: 1,
+          Applicants: [],
+        },
+      },
+      null,
+      2
+    ),
+  },
+  {
+    id: 'confirm-rawdah',
+    label: 'تأكيد تصريح روضة',
+    short: 'تأكيد تصريح',
+    endpoint: 'POST /api/rawdah/confirm-permit',
+    desc: 'تأكيد تصريح روضة بانتظار التأكيد عبر rawdah/v2/confirmPermit',
+    icon: CheckCircle2,
+    accent: 'amber',
+    defaultPayload: JSON.stringify(
+      {
+        Request: {
+          PermitID: '',
+        },
+      },
+      null,
+      2
+    ),
+  },
+  {
+    id: 'cancel-rawdah',
+    label: 'إلغاء تصريح روضة',
+    short: 'إلغاء تصريح',
+    endpoint: 'POST /api/rawdah/cancel-permit',
+    desc: 'إلغاء تصريح روضة قائم عبر rawdah/v2/cancelPermit',
+    icon: Ban,
+    accent: 'rose',
+    defaultPayload: JSON.stringify(
+      {
+        Request: {
+          PermitID: '',
+        },
+      },
+      null,
+      2
+    ),
+  },
+  {
+    id: 'issue-umrah',
+    label: 'إصدار تصريح عمرة',
+    short: 'إصدار عمرة',
+    endpoint: 'POST /api/umrah/issue-permit',
+    desc: 'إصدار تصريح عمرة مباشر عبر umrah/issuePermit',
+    icon: FileCheck2,
+    accent: 'amber',
+    defaultPayload: JSON.stringify(
+      {
+        Request: {
+          Date: '2026-11-21',
+          TimeslotID: 0,
+          ServiceID: 1,
+          Applicants: [],
+        },
+      },
+      null,
+      2
+    ),
+  },
+];
+
+const RAWDAH_TRACKS = [
+  { id: 'external-visitor', label: 'external-visitor (زائر خارجي / معتمر)' },
+  { id: 'citizen-resident', label: 'citizen-resident (مواطن / مقيم)' },
+  { id: 'instant-track', label: 'instant-track (المسار الفوري)' },
+];
+
 function generateRandom16Key() {
   const chars = 'abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789';
   let out = '';
@@ -44,12 +153,15 @@ function generateRandom16Key() {
 
 export default function CryptoLabView({
   connectionState,
+  nusukApiConfig,
+  onUpdateNusukApiConfig,
   onEncrypt,
   onDecrypt,
+  onDirectPermitApi,
   onCopy,
   onNotify,
 }) {
-  const [subTab, setSubTab] = useState('encrypt'); // 'encrypt' | 'decrypt'
+  const [subTab, setSubTab] = useState('encrypt'); // 'encrypt' | 'decrypt' | 'direct-api'
 
   // Encrypt state
   const [inputMode, setInputMode] = useState('fields'); // 'fields' | 'json'
@@ -74,6 +186,23 @@ export default function CryptoLabView({
   const [decryptLoading, setDecryptLoading] = useState(false);
   const [decryptResult, setDecryptResult] = useState(null);
   const [decryptError, setDecryptError] = useState('');
+
+  // Direct Permits API state
+  const [showToken, setShowToken] = useState(false);
+  const [directOp, setDirectOp] = useState('permits');
+  const [issueTrack, setIssueTrack] = useState('external-visitor');
+  const [encryptBody, setEncryptBody] = useState(true);
+  const [directPayloads, setDirectPayloads] = useState(() => {
+    const initial = {};
+    DIRECT_OPERATIONS.forEach((op) => {
+      initial[op.id] = op.defaultPayload;
+    });
+    return initial;
+  });
+  const [extraHeadersText, setExtraHeadersText] = useState('');
+  const [directLoading, setDirectLoading] = useState(false);
+  const [directResult, setDirectResult] = useState(null);
+  const [directError, setDirectError] = useState('');
 
   const offline = connectionState !== 'connected';
 
@@ -181,7 +310,7 @@ export default function CryptoLabView({
     if (!encryptResult?.body) return;
     const jsonBody = JSON.stringify(encryptResult.body);
     const curl = [
-      `curl -X POST "https://services.nusuk.sa/rawdah/v2/availableSlotDays" \\`,
+      `curl -X POST "https://nusukapp.nusuk.sa/nusuk/rawdah/v2/availableSlotDays" \\`,
       `  -H "Content-Type: application/json" \\`,
       `  -d '${jsonBody}'`,
     ].join('\n');
@@ -197,15 +326,95 @@ export default function CryptoLabView({
     onNotify({ type: 'info', title: 'تم النقل لتبويب فك التشفير', message: 'اضغط "فك التشفير الآن" للتحقق من النتيجة.' });
   };
 
+  const currentDirectOp = DIRECT_OPERATIONS.find((o) => o.id === directOp) || DIRECT_OPERATIONS[0];
+  const currentDirectPayloadText = directPayloads[directOp] ?? '{}';
+
+  const handleFormatDirectJson = (target) => {
+    try {
+      if (target === 'payload') {
+        const parsed = JSON.parse(currentDirectPayloadText.trim() || '{}');
+        setDirectPayloads((prev) => ({ ...prev, [directOp]: JSON.stringify(parsed, null, 2) }));
+      } else if (extraHeadersText.trim()) {
+        const parsed = JSON.parse(extraHeadersText.trim());
+        setExtraHeadersText(JSON.stringify(parsed, null, 2));
+      }
+      setDirectError('');
+    } catch (e) {
+      setDirectError(`صيغة JSON غير صحيحة: ${e.message}`);
+    }
+  };
+
+  const handleExecuteDirectApi = async (e) => {
+    e.preventDefault();
+    setDirectError('');
+
+    const token = (nusukApiConfig?.bearerToken || '').trim();
+    if (!token) {
+      setDirectError('يرجى إدخال Bearer Token أولاً لتنفيذ طلبات التصاريح المباشرة.');
+      return;
+    }
+
+    let parsedPayload = {};
+    try {
+      const rawP = currentDirectPayloadText.trim();
+      parsedPayload = rawP ? JSON.parse(rawP) : {};
+      if (typeof parsedPayload !== 'object' || parsedPayload === null || Array.isArray(parsedPayload)) {
+        throw new Error('يجب أن يكون payload كائن JSON (Object)');
+      }
+    } catch (err) {
+      setDirectError(`خطأ في JSON الخاص بـ payload: ${err.message}`);
+      return;
+    }
+
+    let parsedExtraHeaders = null;
+    if (extraHeadersText.trim()) {
+      try {
+        const h = JSON.parse(extraHeadersText.trim());
+        if (typeof h !== 'object' || h === null || Array.isArray(h)) {
+          throw new Error('يجب أن يكون extra_headers كائن JSON مثل {"X-Header": "value"}');
+        }
+        parsedExtraHeaders = h;
+      } catch (err) {
+        setDirectError(`خطأ في JSON الخاص بـ extra_headers: ${err.message}`);
+        return;
+      }
+    }
+
+    const baseBody = {
+      bearer_token: token,
+      device_id: nusukApiConfig?.deviceId?.trim() || null,
+      lang: nusukApiConfig?.lang || 'ar',
+      payload: parsedPayload,
+      ...(parsedExtraHeaders ? { extra_headers: parsedExtraHeaders } : {}),
+    };
+
+    const finalBody =
+      directOp === 'issue-rawdah'
+        ? {
+            ...baseBody,
+            track: issueTrack,
+            encrypt_body: encryptBody,
+          }
+        : baseBody;
+
+    setDirectLoading(true);
+    try {
+      const res = await onDirectPermitApi(directOp, finalBody);
+      setDirectResult(res);
+    } finally {
+      setDirectLoading(false);
+    }
+  };
+
   return (
     <div className="space-y-6">
       {/* Sub-Tabs */}
       <div className="flex flex-wrap items-center justify-between gap-4">
-        <div className="inline-flex rounded-xl border border-slate-800 bg-slate-900/90 p-1">
+        <div className="inline-flex flex-wrap rounded-xl border border-slate-800 bg-slate-900/90 p-1 gap-1">
           <button
             type="button"
             onClick={() => setSubTab('encrypt')}
-            className={`inline-flex items-center gap-2 px-5 py-2 rounded-lg text-sm font-bold transition-all ${
+            className={`inline-flex items-center gap-2 px-4 py-2 rounded-lg text-sm font-bold transition-all ${
               subTab === 'encrypt'
                 ? 'bg-emerald-600 text-white shadow-md shadow-emerald-950/50'
                 : 'text-slate-400 hover:text-slate-200'
@@ -217,7 +426,7 @@ export default function CryptoLabView({
           <button
             type="button"
             onClick={() => setSubTab('decrypt')}
-            className={`inline-flex items-center gap-2 px-5 py-2 rounded-lg text-sm font-bold transition-all ${
+            className={`inline-flex items-center gap-2 px-4 py-2 rounded-lg text-sm font-bold transition-all ${
               subTab === 'decrypt'
                 ? 'bg-amber-500 text-slate-950 shadow-md shadow-amber-950/50'
                 : 'text-slate-400 hover:text-slate-200'
@@ -226,10 +435,24 @@ export default function CryptoLabView({
             <Unlock className="w-4 h-4" />
             <span>فك التشفير (Decrypt)</span>
           </button>
+          <button
+            type="button"
+            onClick={() => setSubTab('direct-api')}
+            className={`inline-flex items-center gap-2 px-4 py-2 rounded-lg text-sm font-bold transition-all ${
+              subTab === 'direct-api'
+                ? 'bg-emerald-500/20 text-emerald-300 border border-emerald-500/40 shadow-md shadow-emerald-950/40'
+                : 'text-slate-400 hover:text-slate-200'
+            }`}
+          >
+            <Send className="w-4 h-4" />
+            <span>إدارة التصاريح المباشرة عبر API</span>
+          </button>
         </div>
 
         <span className="text-xs font-mono text-slate-400 bg-slate-900/80 border border-slate-800 px-3 py-1.5 rounded-xl" dir="ltr">
-          AES-128-CBC • K[0:4] + Base64(Cipher) + K[4:16]
+          {subTab === 'direct-api'
+            ? 'Signed Nusuk API • SHA-256 + AES-128-CBC'
+            : 'AES-128-CBC • K[0:4] + Base64(Cipher) + K[4:16]'}
         </span>
       </div>
 
@@ -510,7 +733,6 @@ export default function CryptoLabView({
               </div>
             ) : (
               <div className="space-y-4">
-                {/* Key */}
                 <div className="space-y-1.5">
                   <div className="flex items-center justify-between text-xs">
                     <span className="font-bold text-slate-400">المفتاح المستخدم (key)</span>
@@ -527,7 +749,6 @@ export default function CryptoLabView({
                   </div>
                 </div>
 
-                {/* Data */}
                 <div className="space-y-1.5">
                   <div className="flex items-center justify-between text-xs">
                     <span className="font-bold text-slate-400">القيمة المشفرة (data)</span>
@@ -544,7 +765,6 @@ export default function CryptoLabView({
                   </div>
                 </div>
 
-                {/* Body */}
                 <div className="space-y-1.5">
                   <div className="flex items-center justify-between text-xs">
                     <span className="font-bold text-slate-400">جسم الطلب الجاهز للإرسال (body)</span>
@@ -561,7 +781,6 @@ export default function CryptoLabView({
                   </pre>
                 </div>
 
-                {/* Request preview */}
                 {encryptResult.request && (
                   <details className="rounded-xl bg-slate-950/60 border border-slate-800 px-3.5 py-2.5">
                     <summary className="text-xs font-bold text-slate-400 cursor-pointer hover:text-slate-200">
@@ -655,6 +874,321 @@ export default function CryptoLabView({
               </pre>
             )}
           </section>
+        </div>
+      )}
+
+      {/* ========================================= */}
+      {/* TAB 3: DIRECT PERMITS API                 */}
+      {/* ========================================= */}
+      {subTab === 'direct-api' && (
+        <div className="space-y-6">
+          {/* Shared Bearer Token / Device ID / Lang Bar */}
+          <section className="rounded-2xl border border-slate-800/90 bg-slate-900/75 p-5 shadow-xl shadow-black/20 space-y-4">
+            <div className="flex flex-wrap items-center justify-between gap-2 pb-2.5 border-b border-slate-800/80">
+              <div className="flex items-center gap-2.5">
+                <div className="w-8 h-8 rounded-xl bg-emerald-500/15 border border-emerald-500/35 text-emerald-400 flex items-center justify-center">
+                  <ShieldCheck className="w-4 h-4" />
+                </div>
+                <div>
+                  <h3 className="text-sm font-extrabold text-white">بيانات التوثيق لطلبات التصاريح المباشرة</h3>
+                  <p className="text-[11px] text-slate-400">
+                    متزامنة تلقائياً مع تبويب رادار الروضة ومحفوظة في <code className="font-mono">localStorage</code>
+                  </p>
+                </div>
+              </div>
+            </div>
+
+            <div className="grid grid-cols-1 lg:grid-cols-12 gap-3.5">
+              <div className="lg:col-span-6 space-y-1.5">
+                <label className="text-xs font-bold text-slate-300 block">
+                  Bearer Token <span className="text-rose-400">*</span>
+                </label>
+                <div className="relative flex items-center">
+                  <KeyRound className="w-4 h-4 text-slate-400 absolute right-3.5 pointer-events-none" />
+                  <input
+                    type={showToken ? 'text' : 'password'}
+                    dir="ltr"
+                    value={nusukApiConfig?.bearerToken || ''}
+                    onChange={(e) => onUpdateNusukApiConfig?.({ bearerToken: e.target.value })}
+                    placeholder="أدخل التوكن الخاص بحساب نسك..."
+                    className="w-full rounded-xl border border-slate-700/80 bg-slate-950/80 pr-10 pl-10 py-2.5 text-xs font-mono text-slate-100 placeholder:text-slate-500 focus:border-emerald-500 focus:outline-none"
+                  />
+                  <button
+                    type="button"
+                    onClick={() => setShowToken((s) => !s)}
+                    className="absolute left-3 text-slate-400 hover:text-slate-200"
+                    aria-label="إظهار أو إخفاء Bearer Token"
+                  >
+                    {showToken ? <EyeOff className="w-4 h-4" /> : <Eye className="w-4 h-4" />}
+                  </button>
+                </div>
+              </div>
+
+              <div className="lg:col-span-4 space-y-1.5">
+                <label className="text-xs font-bold text-slate-300 block">
+                  Device ID <span className="text-slate-500 font-normal">(اختياري)</span>
+                </label>
+                <div className="relative flex items-center">
+                  <Smartphone className="w-4 h-4 text-slate-400 absolute right-3.5 pointer-events-none" />
+                  <input
+                    type="text"
+                    dir="ltr"
+                    value={nusukApiConfig?.deviceId || ''}
+                    onChange={(e) => onUpdateNusukApiConfig?.({ deviceId: e.target.value })}
+                    placeholder="00000000-0000-0000-0000-000000000000"
+                    className="w-full rounded-xl border border-slate-700/80 bg-slate-950/80 pr-10 pl-3.5 py-2.5 text-xs font-mono text-slate-100 placeholder:text-slate-500 focus:border-emerald-500 focus:outline-none"
+                  />
+                </div>
+              </div>
+
+              <div className="lg:col-span-2 space-y-1.5">
+                <label className="text-xs font-bold text-slate-300 block">اللغة</label>
+                <div className="relative flex items-center">
+                  <Globe className="w-4 h-4 text-slate-400 absolute right-3 pointer-events-none" />
+                  <select
+                    value={nusukApiConfig?.lang || 'ar'}
+                    onChange={(e) => onUpdateNusukApiConfig?.({ lang: e.target.value })}
+                    className="w-full rounded-xl border border-slate-700/80 bg-slate-950/80 pr-9 pl-3 py-2.5 text-xs font-bold text-slate-100 focus:border-emerald-500 focus:outline-none"
+                  >
+                    <option value="ar" className="bg-slate-900">العربية (ar)</option>
+                    <option value="en" className="bg-slate-900">English (en)</option>
+                  </select>
+                </div>
+              </div>
+            </div>
+          </section>
+
+          {/* Operation Selector Pills */}
+          <div className="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-5 gap-2.5">
+            {DIRECT_OPERATIONS.map((op) => {
+              const Icon = op.icon;
+              const active = directOp === op.id;
+              const activeCls =
+                op.accent === 'rose'
+                  ? 'bg-rose-500/15 border-rose-500/45 text-rose-200'
+                  : op.accent === 'amber'
+                    ? 'bg-amber-500/15 border-amber-500/45 text-amber-200'
+                    : 'bg-emerald-500/15 border-emerald-500/45 text-emerald-200';
+              return (
+                <button
+                  key={op.id}
+                  type="button"
+                  onClick={() => {
+                    setDirectOp(op.id);
+                    setDirectError('');
+                  }}
+                  className={`rounded-xl border px-3 py-3 text-right transition-all ${
+                    active
+                      ? `${activeCls} shadow-md`
+                      : 'bg-slate-900/70 border-slate-800 text-slate-400 hover:border-slate-700 hover:text-slate-200'
+                  }`}
+                >
+                  <div className="flex items-center gap-2 text-xs font-extrabold">
+                    <Icon className="w-4 h-4 shrink-0" />
+                    <span className="truncate">{op.short}</span>
+                  </div>
+                  <code className="block text-[10px] font-mono opacity-75 truncate mt-1" dir="ltr">
+                    {op.endpoint.replace('POST ', '')}
+                  </code>
+                </button>
+              );
+            })}
+          </div>
+
+          {/* Request Builder + Response Viewer */}
+          <div className="grid grid-cols-1 xl:grid-cols-12 gap-6">
+            <form
+              onSubmit={handleExecuteDirectApi}
+              className="xl:col-span-6 rounded-2xl border border-slate-800/90 bg-slate-900/75 p-6 shadow-xl shadow-black/20 space-y-4"
+            >
+              <div className="pb-3 border-b border-slate-800/80">
+                <div className="flex flex-wrap items-center justify-between gap-2">
+                  <h4 className="text-base font-extrabold text-white">{currentDirectOp.label}</h4>
+                  <code className="text-[11px] font-mono px-2 py-0.5 rounded-md bg-slate-950 text-emerald-300 border border-slate-800" dir="ltr">
+                    {currentDirectOp.endpoint}
+                  </code>
+                </div>
+                <p className="text-xs text-slate-400 mt-1">{currentDirectOp.desc}</p>
+              </div>
+
+              {/* Extra controls only for Rawdah Issue Permit */}
+              {directOp === 'issue-rawdah' && (
+                <div className="space-y-3 rounded-xl border border-emerald-500/25 bg-slate-950/60 p-4">
+                  <div className="space-y-1.5">
+                    <label className="text-xs font-bold text-slate-300 block">
+                      المسار (<code className="font-mono text-emerald-400">track</code>)
+                    </label>
+                    <select
+                      value={issueTrack}
+                      onChange={(e) => setIssueTrack(e.target.value)}
+                      className="w-full rounded-xl border border-slate-700/80 bg-slate-950/90 px-3.5 py-2 text-xs font-bold text-slate-100 focus:border-emerald-500 focus:outline-none"
+                    >
+                      {RAWDAH_TRACKS.map((tr) => (
+                        <option key={tr.id} value={tr.id} className="bg-slate-900">
+                          {tr.label}
+                        </option>
+                      ))}
+                    </select>
+                  </div>
+
+                  <div className="flex items-center justify-between gap-3 pt-1">
+                    <div>
+                      <span className="text-xs font-bold text-slate-200 block">
+                        تشفير جسم الطلب تلقائياً (<code className="font-mono text-emerald-400">encrypt_body</code>)
+                      </span>
+                      <span className="text-[11px] text-slate-400 block mt-0.5">
+                        يُشفّر الـ payload بـ AES-128-CBC ويرسله داخل {'{"data": "..."}'}
+                      </span>
+                    </div>
+                    <ToggleSwitch
+                      checked={encryptBody}
+                      onChange={setEncryptBody}
+                      ariaLabel="تشفير جسم الطلب"
+                    />
+                  </div>
+                </div>
+              )}
+
+              {/* Payload JSON */}
+              <div className="space-y-1.5">
+                <div className="flex items-center justify-between">
+                  <label className="text-xs font-bold text-slate-300">
+                    جسم الطلب JSON (<code className="font-mono text-emerald-400">payload</code>)
+                  </label>
+                  <button
+                    type="button"
+                    onClick={() => handleFormatDirectJson('payload')}
+                    className="inline-flex items-center gap-1 px-2.5 py-1 rounded-lg text-[11px] font-semibold bg-slate-800 hover:bg-slate-700 text-slate-300 transition-colors"
+                  >
+                    <Braces className="w-3 h-3" />
+                    <span>تنسيق JSON</span>
+                  </button>
+                </div>
+                <textarea
+                  rows={8}
+                  dir="ltr"
+                  value={currentDirectPayloadText}
+                  onChange={(e) =>
+                    setDirectPayloads((prev) => ({ ...prev, [directOp]: e.target.value }))
+                  }
+                  className="w-full rounded-xl border border-slate-700/80 bg-slate-950/85 p-3.5 text-xs font-mono text-emerald-200 focus:border-emerald-500 focus:outline-none focus:ring-2 focus:ring-emerald-500/20"
+                />
+              </div>
+
+              {/* Optional extra_headers JSON */}
+              <div className="space-y-1.5">
+                <div className="flex items-center justify-between">
+                  <label className="text-xs font-bold text-slate-300">
+                    هيدرز إضافية (<code className="font-mono text-amber-300">extra_headers</code>) —{' '}
+                    <span className="text-slate-500 font-normal">JSON اختياري</span>
+                  </label>
+                  {extraHeadersText.trim() && (
+                    <button
+                      type="button"
+                      onClick={() => handleFormatDirectJson('headers')}
+                      className="inline-flex items-center gap-1 px-2 py-0.5 rounded-md text-[11px] font-semibold bg-slate-800 hover:bg-slate-700 text-slate-300"
+                    >
+                      <Braces className="w-3 h-3" />
+                      <span>تنسيق</span>
+                    </button>
+                  )}
+                </div>
+                <textarea
+                  rows={3}
+                  dir="ltr"
+                  value={extraHeadersText}
+                  onChange={(e) => setExtraHeadersText(e.target.value)}
+                  placeholder='{"X-Custom-Header": "value"}'
+                  className="w-full rounded-xl border border-slate-700/80 bg-slate-950/85 p-3 text-xs font-mono text-amber-200 placeholder:text-slate-600 focus:border-amber-500 focus:outline-none"
+                />
+              </div>
+
+              {directError && (
+                <div className="rounded-xl border border-rose-500/40 bg-rose-950/30 px-3.5 py-2.5 text-xs text-rose-200 flex items-center gap-2">
+                  <AlertCircle className="w-4 h-4 text-rose-400 shrink-0" />
+                  <span>{directError}</span>
+                </div>
+              )}
+
+              <button
+                type="submit"
+                disabled={offline || directLoading}
+                className={`w-full inline-flex items-center justify-center gap-2 px-5 py-3 rounded-xl text-sm font-extrabold shadow-lg transition-all disabled:opacity-45 ${
+                  currentDirectOp.accent === 'rose'
+                    ? 'bg-rose-600 hover:bg-rose-500 text-white shadow-rose-950/50'
+                    : currentDirectOp.accent === 'amber'
+                      ? 'bg-amber-500 hover:bg-amber-400 text-slate-950 shadow-amber-950/40'
+                      : 'bg-emerald-600 hover:bg-emerald-500 text-white shadow-emerald-950/50'
+                }`}
+              >
+                {directLoading ? <Loader2 className="w-4 h-4 animate-spin" /> : <Send className="w-4 h-4" />}
+                <span>تنفيذ: {currentDirectOp.label}</span>
+              </button>
+            </form>
+
+            {/* Response Viewer */}
+            <section className="xl:col-span-6 rounded-2xl border border-slate-800/90 bg-slate-900/75 p-6 shadow-xl shadow-black/20 space-y-4">
+              <div className="flex flex-wrap items-center justify-between gap-2 pb-3 border-b border-slate-800/80">
+                <div className="flex flex-wrap items-center gap-2">
+                  <h4 className="text-base font-extrabold text-white">استجابة سيرفر نسك (Pretty JSON)</h4>
+                  {directResult && (
+                    <>
+                      <span
+                        className={`inline-flex items-center gap-1 px-2.5 py-0.5 rounded-full text-xs font-bold border ${
+                          directResult.success
+                            ? 'bg-emerald-500/15 border-emerald-500/35 text-emerald-300'
+                            : 'bg-rose-500/15 border-rose-500/35 text-rose-300'
+                        }`}
+                      >
+                        {directResult.success ? (
+                          <CheckCircle2 className="w-3.5 h-3.5" />
+                        ) : (
+                          <XCircle className="w-3.5 h-3.5" />
+                        )}
+                        <span>{directResult.success ? 'نجاح' : 'فشل'}</span>
+                      </span>
+                      <span
+                        className="px-2 py-0.5 rounded-md font-mono text-xs bg-slate-950 text-slate-300 border border-slate-800"
+                        dir="ltr"
+                      >
+                        HTTP {directResult.http_status ?? '—'}
+                      </span>
+                    </>
+                  )}
+                </div>
+
+                {directResult && (
+                  <button
+                    type="button"
+                    onClick={() => onCopy(JSON.stringify(directResult, null, 2), 'تم نسخ استجابة الـ API')}
+                    className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-bold bg-emerald-500/15 hover:bg-emerald-500/25 text-emerald-300 border border-emerald-500/30 transition-colors"
+                  >
+                    <Copy className="w-3.5 h-3.5" />
+                    <span>نسخ JSON</span>
+                  </button>
+                )}
+              </div>
+
+              {directResult?.endpoint && (
+                <div className="text-xs font-mono text-slate-400 bg-slate-950/70 border border-slate-800 px-3 py-2 rounded-xl" dir="ltr">
+                  Endpoint: <span className="text-emerald-300">{directResult.endpoint}</span>
+                </div>
+              )}
+
+              {!directResult ? (
+                <div className="rounded-xl border border-dashed border-slate-800 py-24 text-center text-slate-500 text-sm">
+                  اختر العملية واضغط تنفيذ لعرض كود الـ HTTP والاستجابة الكاملة بصيغة Pretty JSON هنا.
+                </div>
+              ) : (
+                <pre
+                  className="rounded-xl bg-slate-950 border border-slate-800 p-4 font-mono text-xs text-emerald-300 overflow-x-auto max-h-[460px] leading-relaxed"
+                  dir="ltr"
+                >
+                  {JSON.stringify(directResult, null, 2)}
+                </pre>
+              )}
+            </section>
+          </div>
         </div>
       )}
     </div>

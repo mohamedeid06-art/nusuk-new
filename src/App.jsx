@@ -5,6 +5,8 @@ import ToastContainer from './components/ToastContainer';
 import ImageModal from './components/ImageModal';
 import OverviewView from './views/OverviewView';
 import RegistrationView from './views/RegistrationView';
+import BookingView from './views/BookingView';
+import RadarView from './views/RadarView';
 import EmulatorsHealthView from './views/EmulatorsHealthView';
 import CryptoLabView from './views/CryptoLabView';
 import ActivityLogView from './views/ActivityLogView';
@@ -13,9 +15,15 @@ import { nusukApi } from './services/api';
 import {
   loadSettings,
   saveSettings,
+  loadNusukApiConfig,
+  saveNusukApiConfig,
   loadActivityLogs,
   saveActivityLogs,
 } from './utils/storage';
+import {
+  playRawdahAlertSound,
+  sendBrowserNotification,
+} from './utils/soundAlert';
 import { POLLING_INTERVAL_MS } from './constants/nationalities';
 
 function buildPilgrimRequestPayload(settings, input) {
@@ -40,6 +48,8 @@ function buildPilgrimRequestPayload(settings, input) {
     pilgrim,
     nationality: input.nationality || settings.defaultNationality || 'مصر',
     force_role: input.forceRole || null,
+    auto_close_group: input.autoCloseGroup !== undefined ? Boolean(input.autoCloseGroup) : true,
+    skip_permit_check: Boolean(input.skipPermitCheck),
   };
 }
 
@@ -52,6 +62,16 @@ export default function App() {
   useEffect(() => {
     settingsRef.current = settings;
   }, [settings]);
+
+  // Shared Nusuk API Config (Bearer Token, Device ID, Lang) persisted in localStorage
+  const [nusukApiConfig, setNusukApiConfig] = useState(() => loadNusukApiConfig());
+  const handleUpdateNusukApiConfig = useCallback((patch) => {
+    setNusukApiConfig((prev) => {
+      const next = { ...prev, ...patch };
+      saveNusukApiConfig(next);
+      return next;
+    });
+  }, []);
 
   // Live server status state
   const [connectionState, setConnectionState] = useState('connecting'); // connecting | connected | offline
@@ -69,6 +89,22 @@ export default function App() {
   const [singleLoading, setSingleLoading] = useState(null); // null | 'register' | 'recover'
   const [lastSingleResult, setLastSingleResult] = useState(null);
 
+  // Booking engine state
+  const [bookingLoading, setBookingLoading] = useState(null); // null | 'rawdah' | 'for-anyone' | 'login'
+  const [lastBookingResult, setLastBookingResult] = useState(null);
+  const [prefillBookingSlot, setPrefillBookingSlot] = useState(null);
+
+  // Rawdah Radar state
+  const [radarStatus, setRadarStatus] = useState(null);
+  const [radarBannerVisible, setRadarBannerVisible] = useState(false);
+  const [soundEnabled, setSoundEnabled] = useState(true);
+  const soundEnabledRef = useRef(true);
+  useEffect(() => {
+    soundEnabledRef.current = soundEnabled;
+  }, [soundEnabled]);
+  const prevHasOpenSlotsRef = useRef(false);
+  const radarInFlightRef = useRef(false);
+
   // Bulk queue state (lifted so tab switches never interrupt execution)
   const [bulkState, setBulkState] = useState({
     items: [],
@@ -76,6 +112,8 @@ export default function App() {
     paused: false,
     mode: 'register', // 'register' | 'recover'
     forceRole: '',
+    autoCloseGroup: true,
+    skipPermitCheck: false,
   });
   const bulkStateRef = useRef(bulkState);
   useEffect(() => {
@@ -144,6 +182,50 @@ export default function App() {
     [addToast]
   );
 
+  // Trigger open slots alert (Audio + Green Banner + Browser Notification + Toast)
+  const triggerOpenSlotsAlert = useCallback(
+    (days = []) => {
+      const openDays = days.filter((d) => (d.slots_count ?? d.slots?.length ?? 0) > 0);
+      const totalSlots = openDays.reduce((acc, d) => acc + (d.slots_count ?? d.slots?.length ?? 0), 0);
+      const summaryText =
+        openDays.length > 0
+          ? `تم رصد ${openDays.length} يوم متاح (${totalSlots} فترة) في الروضة الشريفة!`
+          : 'تم رصد مواعيد متاحة في الروضة الشريفة الآن!';
+
+      setRadarBannerVisible(true);
+      if (soundEnabledRef.current) {
+        playRawdahAlertSound();
+      }
+      sendBrowserNotification('مواعيد الروضة الشريفة متاحة الآن!', summaryText);
+      addToast({
+        type: 'success',
+        title: 'تنبيه رادار الروضة: مواعيد مفتوحة!',
+        message: summaryText,
+      });
+    },
+    [addToast]
+  );
+
+  // Fetch /api/rawdah/monitor/status
+  const fetchRadarStatus = useCallback(async () => {
+    if (radarInFlightRef.current) return;
+    radarInFlightRef.current = true;
+    try {
+      const { data } = await nusukApi.getRawdahMonitorStatus(settingsRef.current.apiBaseUrl);
+      setRadarStatus(data);
+
+      const hasOpen = Boolean(data?.has_open_slots);
+      if (hasOpen && !prevHasOpenSlotsRef.current) {
+        triggerOpenSlotsAlert(data.available_days || []);
+      }
+      prevHasOpenSlotsRef.current = hasOpen;
+    } catch {
+      // Silently ignore when backend offline
+    } finally {
+      radarInFlightRef.current = false;
+    }
+  }, [triggerOpenSlotsAlert]);
+
   // Fetch /api/status
   const fetchStatus = useCallback(async (manual = false) => {
     if (statusInFlightRef.current && !manual) return;
@@ -163,7 +245,7 @@ export default function App() {
     }
   }, []);
 
-  // Automatic 3-second polling
+  // Automatic 3-second polling for server status
   useEffect(() => {
     fetchStatus(false);
     if (!settings.pollingEnabled) return undefined;
@@ -174,6 +256,24 @@ export default function App() {
 
     return () => clearInterval(timer);
   }, [settings.apiBaseUrl, settings.pollingEnabled, fetchStatus]);
+
+  // Initial fetch of radar status once connected
+  useEffect(() => {
+    if (connectionState === 'connected') {
+      fetchRadarStatus();
+    }
+  }, [connectionState, settings.apiBaseUrl, fetchRadarStatus]);
+
+  // Poll /api/rawdah/monitor/status every 3 seconds while radar is running
+  useEffect(() => {
+    if (connectionState !== 'connected' || !radarStatus?.running) return undefined;
+
+    const timer = setInterval(() => {
+      fetchRadarStatus();
+    }, 3000);
+
+    return () => clearInterval(timer);
+  }, [connectionState, radarStatus?.running, fetchRadarStatus]);
 
   const handleSaveSettings = useCallback(
     (nextSettings) => {
@@ -394,6 +494,379 @@ export default function App() {
     [appendLog, addToast, fetchStatus]
   );
 
+  // ==========================================
+  // Booking Engine Handlers
+  // ==========================================
+  const handleBookLogin = useCallback(
+    async (payload) => {
+      setBookingLoading('login');
+      try {
+        const { data } = await nusukApi.bookLogin(settingsRef.current.apiBaseUrl, payload);
+        setLastBookingResult(data);
+        appendLog({
+          title: `تسجيل دخول حساب (${payload.email}) على ${payload.emu_key}`,
+          endpoint: 'POST /api/book/login',
+          outcome: data.success ? 'success' : 'error',
+          message: data.success
+            ? data.otp_used
+              ? 'تم تسجيل الدخول بنجاح عبر OTP'
+              : 'تم تسجيل الدخول بنجاح مباشرة'
+            : data.error || data.message,
+          screenshot: data.screenshot || null,
+          payload: data,
+        });
+        addToast({
+          type: data.success ? 'success' : 'error',
+          title: data.success ? 'تم تسجيل الدخول بنجاح' : 'فشل تسجيل الدخول',
+          message: data.error || data.message,
+        });
+        fetchStatus(true);
+        return data;
+      } catch (err) {
+        const errObj = { success: false, status: 'error', error: err.message };
+        setLastBookingResult(errObj);
+        appendLog({
+          title: `تسجيل دخول (${payload.email})`,
+          endpoint: 'POST /api/book/login',
+          outcome: 'error',
+          message: err.message,
+        });
+        addToast({ type: 'error', title: 'خطأ أثناء تسجيل الدخول', message: err.message });
+        return errObj;
+      } finally {
+        setBookingLoading(null);
+      }
+    },
+    [appendLog, addToast, fetchStatus]
+  );
+
+  const handleBookRawdah = useCallback(
+    async (payload) => {
+      setBookingLoading('rawdah');
+      try {
+        const { data } = await nusukApi.bookRawdah(settingsRef.current.apiBaseUrl, payload);
+        setLastBookingResult(data);
+        const outcome = data.success
+          ? 'success'
+          : data.status === 'ineligible_or_unavailable'
+            ? 'ineligible'
+            : data.status === 'no_available_slots' || data.status === 'no_available_dates'
+              ? 'warning'
+              : 'error';
+        appendLog({
+          title: `${payload.dry_run ? '[تجريبي] ' : ''}حجز الروضة للحساب المفتوح (${payload.emu_key})`,
+          endpoint: 'POST /api/book/rawdah',
+          outcome,
+          message: [
+            data.message || data.error,
+            data.permit_number ? `رقم التصريح: ${data.permit_number}` : '',
+            data.selected_slot ? `الموعد: ${data.selected_date || ''} ${data.selected_slot}` : '',
+          ]
+            .filter(Boolean)
+            .join(' | '),
+          screenshot: data.screenshot || null,
+          payload: data,
+        });
+        addToast({
+          type: data.success ? 'success' : outcome === 'warning' ? 'warning' : 'error',
+          title:
+            data.status === 'booked'
+              ? 'تم إصدار تصريح الروضة بنجاح!'
+              : data.status === 'dry_run_ready'
+                ? 'التشغيل التجريبي جاهز للتأكيد'
+                : 'نتيجة محاولة الحجز',
+          message: data.message || data.error,
+        });
+        fetchStatus(true);
+        return data;
+      } catch (err) {
+        const errObj = { success: false, status: 'error', error: err.message };
+        setLastBookingResult(errObj);
+        appendLog({
+          title: `حجز الروضة (${payload.emu_key})`,
+          endpoint: 'POST /api/book/rawdah',
+          outcome: 'error',
+          message: err.message,
+        });
+        addToast({ type: 'error', title: 'خطأ في الحجز', message: err.message });
+        return errObj;
+      } finally {
+        setBookingLoading(null);
+      }
+    },
+    [appendLog, addToast, fetchStatus]
+  );
+
+  const handleBookForAnyone = useCallback(
+    async (payload) => {
+      setBookingLoading('for-anyone');
+      try {
+        const { data } = await nusukApi.bookForAnyone(settingsRef.current.apiBaseUrl, payload);
+        setLastBookingResult(data);
+        const outcome = data.success
+          ? 'success'
+          : data.status === 'ineligible_or_unavailable'
+            ? 'ineligible'
+            : data.status === 'no_available_slots' || data.status === 'no_available_dates'
+              ? 'warning'
+              : 'error';
+        appendLog({
+          title: `${payload.dry_run ? '[تجريبي] ' : ''}حجز لأي حد — ${payload.email || 'الحساب المفتوح'} (${payload.emu_key})`,
+          endpoint: 'POST /api/book/for-anyone',
+          outcome,
+          message: [
+            data.message || data.error,
+            data.permit_number ? `رقم التصريح: ${data.permit_number}` : '',
+            data.selected_slot ? `الموعد: ${data.selected_date || ''} ${data.selected_slot}` : '',
+          ]
+            .filter(Boolean)
+            .join(' | '),
+          screenshot: data.screenshot || null,
+          payload: data,
+        });
+        addToast({
+          type: data.success ? 'success' : outcome === 'warning' ? 'warning' : 'error',
+          title:
+            data.status === 'booked'
+              ? 'تم الحجز وإصدار التصريح بنجاح!'
+              : data.status === 'dry_run_ready'
+                ? 'التشغيل التجريبي جاهز للتأكيد'
+                : 'نتيجة الحجز',
+          message: data.message || data.error,
+        });
+        fetchStatus(true);
+        return data;
+      } catch (err) {
+        const errObj = { success: false, status: 'error', error: err.message };
+        setLastBookingResult(errObj);
+        appendLog({
+          title: `حجز لأي حد (${payload.email || payload.emu_key})`,
+          endpoint: 'POST /api/book/for-anyone',
+          outcome: 'error',
+          message: err.message,
+        });
+        addToast({ type: 'error', title: 'خطأ في الحجز لأي حد', message: err.message });
+        return errObj;
+      } finally {
+        setBookingLoading(null);
+      }
+    },
+    [appendLog, addToast, fetchStatus]
+  );
+
+  const handleBookFromRadarSlot = useCallback(
+    ({ date, time }) => {
+      setPrefillBookingSlot({ date: date || '', time: time || '' });
+      setActiveTab('booking');
+      addToast({
+        type: 'info',
+        title: 'تم نقل الموعد لتبويب الحجز',
+        message: [date, time].filter(Boolean).join(' • ') || 'جاهز لتنفيذ الحجز',
+      });
+    },
+    [addToast]
+  );
+
+  // ==========================================
+  // Rawdah Radar & Nusuk API Handlers
+  // ==========================================
+  const handleCheckServerTime = useCallback(async () => {
+    try {
+      const { data } = await nusukApi.getNusukServerTime(settingsRef.current.apiBaseUrl);
+      appendLog({
+        title: 'فحص وقت سيرفر نسك',
+        endpoint: 'GET /api/nusuk/server-time',
+        outcome: data.success ? 'success' : 'error',
+        message: data.success ? `HTTP ${data.http_status} — الاتصال والتوقيع سليمان` : data.error,
+        payload: data,
+      });
+      addToast({
+        type: data.success ? 'success' : 'error',
+        title: data.success ? 'اتصال سيرفر نسك سليم' : 'فشل الاتصال بسيرفر نسك',
+        message: data.http_status ? `HTTP ${data.http_status}` : data.error,
+      });
+      return data;
+    } catch (err) {
+      addToast({ type: 'error', title: 'فشل فحص وقت سيرفر نسك', message: err.message });
+      return { success: false, error: err.message };
+    }
+  }, [appendLog, addToast]);
+
+  const handleSignHeaders = useCallback(
+    async (payload) => {
+      try {
+        const { data } = await nusukApi.signNusukHeaders(settingsRef.current.apiBaseUrl, payload);
+        appendLog({
+          title: 'توليد هيدرز نسك الموقّعة',
+          endpoint: 'POST /api/nusuk/sign-headers',
+          outcome: data.success ? 'success' : 'error',
+          message: data.headers?.timestamp ? `Timestamp: ${data.headers.timestamp}` : data.error,
+          payload: data,
+        });
+        if (data.success) {
+          addToast({ type: 'success', title: 'تم توليد الهيدرز الموقّعة بنجاح' });
+        }
+        return data;
+      } catch (err) {
+        addToast({ type: 'error', title: 'فشل توليد الهيدرز', message: err.message });
+        return { success: false, error: err.message };
+      }
+    },
+    [appendLog, addToast]
+  );
+
+  const handleStartRadar = useCallback(
+    async (payload) => {
+      try {
+        const { data } = await nusukApi.startRawdahMonitor(settingsRef.current.apiBaseUrl, payload);
+        appendLog({
+          title: `تشغيل رادار الروضة (كل ${payload.interval_seconds}ث)`,
+          endpoint: 'POST /api/rawdah/monitor/start',
+          outcome: data.success ? 'success' : 'warning',
+          message: data.message || data.error,
+          payload: data,
+        });
+        addToast({
+          type: data.success ? 'success' : 'warning',
+          title: data.success ? 'تم تشغيل رادار الروضة' : 'تنبيه الرادار',
+          message: data.message || data.error,
+        });
+        prevHasOpenSlotsRef.current = false;
+        await fetchRadarStatus();
+        return data;
+      } catch (err) {
+        addToast({ type: 'error', title: 'فشل تشغيل الرادار', message: err.message });
+        return { success: false, error: err.message };
+      }
+    },
+    [appendLog, addToast, fetchRadarStatus]
+  );
+
+  const handleStopRadar = useCallback(async () => {
+    try {
+      const { data } = await nusukApi.stopRawdahMonitor(settingsRef.current.apiBaseUrl);
+      appendLog({
+        title: 'إيقاف رادار الروضة',
+        endpoint: 'POST /api/rawdah/monitor/stop',
+        outcome: data.success ? 'success' : 'error',
+        message: data.message || data.error,
+        payload: data,
+      });
+      addToast({ type: 'info', title: 'تم إيقاف رادار الروضة', message: data.message });
+      await fetchRadarStatus();
+      return data;
+    } catch (err) {
+      addToast({ type: 'error', title: 'فشل إيقاف الرادار', message: err.message });
+      return { success: false, error: err.message };
+    }
+  }, [appendLog, addToast, fetchRadarStatus]);
+
+  const handleCheckNowSlots = useCallback(
+    async (payload) => {
+      try {
+        const { data } = await nusukApi.getRawdahAvailableSlots(settingsRef.current.apiBaseUrl, payload);
+        appendLog({
+          title: 'فحص فوري لمواعيد الروضة',
+          endpoint: 'POST /api/rawdah/available-slots',
+          outcome: data.success ? 'success' : 'error',
+          message: data.success
+            ? `HTTP ${data.http_status} | ${data.available_days?.length || 0} يوم | ${data.has_open_slots ? 'توجد مواعيد متاحة!' : 'لا توجد فترات مفتوحة'}`
+            : data.error || `HTTP ${data.http_status}`,
+          payload: data,
+        });
+        if (data.has_open_slots) {
+          triggerOpenSlotsAlert(data.available_days || []);
+        } else if (data.success) {
+          addToast({
+            type: 'info',
+            title: 'انتهى الفحص الفوري',
+            message: `تم جلب ${data.available_days?.length || 0} يوم — لا توجد فترات مفتوحة حالياً.`,
+          });
+        } else {
+          addToast({
+            type: 'error',
+            title: 'فشل فحص المواعيد',
+            message: data.error || `HTTP ${data.http_status}`,
+          });
+        }
+        return data;
+      } catch (err) {
+        addToast({ type: 'error', title: 'خطأ في فحص المواعيد', message: err.message });
+        return { success: false, error: err.message };
+      }
+    },
+    [appendLog, addToast, triggerOpenSlotsAlert]
+  );
+
+  const handleQueryUmrahDates = useCallback(
+    async (payload) => {
+      try {
+        const { data } = await nusukApi.getUmrahAvailableDates(settingsRef.current.apiBaseUrl, payload);
+        appendLog({
+          title: 'استعلام مواعيد العمرة المتاحة',
+          endpoint: 'POST /api/umrah/available-dates',
+          outcome: data.success ? 'success' : 'error',
+          message: data.success ? `HTTP ${data.http_status}` : data.error || `HTTP ${data.http_status}`,
+          payload: data,
+        });
+        addToast({
+          type: data.success ? 'success' : 'error',
+          title: data.success ? 'تم جلب مواعيد العمرة' : 'فشل استعلام مواعيد العمرة',
+          message: data.http_status ? `HTTP ${data.http_status}` : data.error,
+        });
+        return data;
+      } catch (err) {
+        addToast({ type: 'error', title: 'خطأ في استعلام العمرة', message: err.message });
+        return { success: false, error: err.message };
+      }
+    },
+    [appendLog, addToast]
+  );
+
+  // ==========================================
+  // Direct Permits API Handler (CryptoLabView)
+  // ==========================================
+  const handleDirectPermitApi = useCallback(
+    async (opId, body) => {
+      const apiMap = {
+        permits: { fn: nusukApi.getRawdahPermits, title: 'جلب تصاريح الروضة', ep: 'POST /api/rawdah/permits' },
+        'issue-rawdah': { fn: nusukApi.issueRawdahPermit, title: `إصدار تصريح روضة (${body.track})`, ep: 'POST /api/rawdah/issue-permit' },
+        'confirm-rawdah': { fn: nusukApi.confirmRawdahPermit, title: 'تأكيد تصريح روضة', ep: 'POST /api/rawdah/confirm-permit' },
+        'cancel-rawdah': { fn: nusukApi.cancelRawdahPermit, title: 'إلغاء تصريح روضة', ep: 'POST /api/rawdah/cancel-permit' },
+        'issue-umrah': { fn: nusukApi.issueUmrahPermit, title: 'إصدار تصريح عمرة', ep: 'POST /api/umrah/issue-permit' },
+      };
+      const entry = apiMap[opId];
+      if (!entry) return { success: false, error: 'عملية غير معروفة' };
+
+      try {
+        const { data } = await entry.fn(settingsRef.current.apiBaseUrl, body);
+        appendLog({
+          title: entry.title,
+          endpoint: entry.ep,
+          outcome: data.success ? 'success' : 'error',
+          message: data.http_status ? `HTTP ${data.http_status}` : data.error,
+          payload: data,
+        });
+        addToast({
+          type: data.success ? 'success' : 'error',
+          title: data.success ? `${entry.title}: نجاح` : `${entry.title}: فشل`,
+          message: data.http_status ? `HTTP ${data.http_status}` : data.error,
+        });
+        return data;
+      } catch (err) {
+        appendLog({
+          title: entry.title,
+          endpoint: entry.ep,
+          outcome: 'error',
+          message: err.message,
+        });
+        addToast({ type: 'error', title: `خطأ في ${entry.title}`, message: err.message });
+        return { success: false, error: err.message };
+      }
+    },
+    [appendLog, addToast]
+  );
+
   // Bulk Queue Helpers
   const handleAddBulkItems = useCallback((newItems) => {
     setBulkState((prev) => ({
@@ -462,6 +935,8 @@ export default function App() {
 
       const mode = bulkStateRef.current.mode;
       const forceRole = bulkStateRef.current.forceRole || null;
+      const autoCloseGroup = bulkStateRef.current.autoCloseGroup;
+      const skipPermitCheck = bulkStateRef.current.skipPermitCheck;
       const endpoint = mode === 'recover' ? 'POST /api/recover' : 'POST /api/register';
 
       setBulkState((prev) => ({
@@ -478,6 +953,8 @@ export default function App() {
         email: nextItem.email,
         password: nextItem.password,
         forceRole,
+        autoCloseGroup,
+        skipPermitCheck,
       });
 
       let data = null;
@@ -647,6 +1124,7 @@ export default function App() {
         mobileOpen={mobileMenuOpen}
         onCloseMobile={() => setMobileMenuOpen(false)}
         statusData={statusData}
+        radarStatus={radarStatus}
         logsCount={logs.length}
         screenshotsCount={screenshotsCount}
         queueRunning={bulkState.running}
@@ -659,10 +1137,15 @@ export default function App() {
           onOpenMobileMenu={() => setMobileMenuOpen(true)}
           connectionState={connectionState}
           statusData={statusData}
+          radarStatus={radarStatus}
           lastUpdated={lastUpdated}
           isRefreshing={isRefreshing}
-          onManualRefresh={() => fetchStatus(true)}
+          onManualRefresh={() => {
+            fetchStatus(true);
+            fetchRadarStatus();
+          }}
           onOpenSettings={() => setActiveTab('settings')}
+          onOpenRadar={() => setActiveTab('radar')}
           apiBaseUrl={settings.apiBaseUrl}
         />
 
@@ -702,6 +1185,51 @@ export default function App() {
             />
           )}
 
+          {activeTab === 'booking' && (
+            <BookingView
+              settings={settings}
+              statusData={statusData}
+              connectionState={connectionState}
+              bookingLoading={bookingLoading}
+              lastBookingResult={lastBookingResult}
+              prefillSlot={prefillBookingSlot}
+              onClearPrefill={() => setPrefillBookingSlot(null)}
+              onBookRawdah={handleBookRawdah}
+              onBookForAnyone={handleBookForAnyone}
+              onBookLogin={handleBookLogin}
+              onCopy={handleCopy}
+              onOpenImage={setActiveImage}
+              onNavigateSettings={() => setActiveTab('settings')}
+              onNotify={addToast}
+            />
+          )}
+
+          {activeTab === 'radar' && (
+            <RadarView
+              connectionState={connectionState}
+              nusukApiConfig={nusukApiConfig}
+              onUpdateNusukApiConfig={handleUpdateNusukApiConfig}
+              radarStatus={radarStatus}
+              radarBannerVisible={radarBannerVisible}
+              onDismissRadarBanner={() => setRadarBannerVisible(false)}
+              soundEnabled={soundEnabled}
+              onToggleSound={() => setSoundEnabled((s) => !s)}
+              onTestSound={() => {
+                playRawdahAlertSound();
+                addToast({ type: 'info', title: 'تم تشغيل نغمة التنبيه التجريبية' });
+              }}
+              onStartRadar={handleStartRadar}
+              onStopRadar={handleStopRadar}
+              onCheckNowSlots={handleCheckNowSlots}
+              onCheckServerTime={handleCheckServerTime}
+              onSignHeaders={handleSignHeaders}
+              onQueryUmrahDates={handleQueryUmrahDates}
+              onBookSlot={handleBookFromRadarSlot}
+              onCopy={handleCopy}
+              onNotify={addToast}
+            />
+          )}
+
           {activeTab === 'health' && (
             <EmulatorsHealthView
               statusData={statusData}
@@ -717,8 +1245,11 @@ export default function App() {
           {activeTab === 'crypto' && (
             <CryptoLabView
               connectionState={connectionState}
+              nusukApiConfig={nusukApiConfig}
+              onUpdateNusukApiConfig={handleUpdateNusukApiConfig}
               onEncrypt={handleEncryptRawdah}
               onDecrypt={handleDecryptRawdah}
+              onDirectPermitApi={handleDirectPermitApi}
               onCopy={handleCopy}
               onNotify={addToast}
             />

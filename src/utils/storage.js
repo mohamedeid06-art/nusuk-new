@@ -1,7 +1,8 @@
-import { DEFAULT_SETTINGS } from '../constants/nationalities';
+import { DEFAULT_SETTINGS, DEFAULT_NUSUK_API_CONFIG } from '../constants/nationalities';
 
 const SETTINGS_KEY = 'nusuk_pro_dashboard_settings_v1';
 const LOGS_KEY = 'nusuk_pro_dashboard_logs_v1';
+const NUSUK_API_CONFIG_KEY = 'nusuk_pro_dashboard_nusuk_api_v1';
 const MAX_LOGS = 200;
 
 export function loadSettings() {
@@ -22,6 +23,31 @@ export function loadSettings() {
 export function saveSettings(settings) {
   try {
     localStorage.setItem(SETTINGS_KEY, JSON.stringify(settings));
+  } catch {
+    // Ignore storage quota issues
+  }
+}
+
+export function loadNusukApiConfig() {
+  try {
+    const raw = localStorage.getItem(NUSUK_API_CONFIG_KEY);
+    if (!raw) return { ...DEFAULT_NUSUK_API_CONFIG };
+    const parsed = JSON.parse(raw);
+    return {
+      ...DEFAULT_NUSUK_API_CONFIG,
+      ...parsed,
+      bearerToken: String(parsed.bearerToken || ''),
+      deviceId: String(parsed.deviceId || ''),
+      lang: parsed.lang === 'en' ? 'en' : 'ar',
+    };
+  } catch {
+    return { ...DEFAULT_NUSUK_API_CONFIG };
+  }
+}
+
+export function saveNusukApiConfig(config) {
+  try {
+    localStorage.setItem(NUSUK_API_CONFIG_KEY, JSON.stringify(config));
   } catch {
     // Ignore storage quota issues
   }

@@ -8,6 +8,7 @@ import {
   Gauge,
   Settings,
   Cpu,
+  Radar,
 } from 'lucide-react';
 
 const TAB_TITLES = {
@@ -17,19 +18,27 @@ const TAB_TITLES = {
   },
   register: {
     title: 'مركز تسجيل المعتمرين واسترجاع الحسابات',
-    subtitle: 'تسجيل فردي أو جماعي من Excel مع فحص تلقائي لأحقية تصريح الروضة',
+    subtitle: 'تسجيل فردي أو جماعي من Excel مع خيارات إغلاق الجروب وفحص الروضة',
+  },
+  booking: {
+    title: 'الحجز لأي حد (Rawdah Booking Engine)',
+    subtitle: 'حجز الروضة الشريفة للحساب المفتوح أو لأي شخص جديد مع وضع التشغيل التجريبي الآمن',
+  },
+  radar: {
+    title: 'رادار الروضة والمواعيد الحية (Rawdah Radar)',
+    subtitle: 'مراقبة تلقائية لمواعيد الروضة مع تنبيه صوتي فوري واستعلام مواعيد العمرة',
   },
   health: {
     title: 'مراقبة صحة المحاكيات والتحكم بها',
     subtitle: 'فحص اتصال المحاكيين emu1 و emu2 وتدوير البصمة وإعادة التشغيل',
   },
   crypto: {
-    title: 'مختبر تشفير الروضة (Rawdah v2 Crypto Lab)',
-    subtitle: 'تشفير وفك تشفير طلبات AES-128-CBC لـ /rawdah/v2/availableSlotDays',
+    title: 'أدوات الروضة والـ API (Crypto Lab & Direct Permits)',
+    subtitle: 'تشفير وفك تشفير AES-128-CBC وإدارة تصاريح الروضة والعمرة المباشرة عبر Nusuk API',
   },
   logs: {
-    title: 'سجل العمليات ولقطات الأخطاء',
-    subtitle: 'تتبع كافة طلبات الجلسة واستعراض لقطات فشل المحاكيات بدقة عالية',
+    title: 'سجل العمليات ولقطات الشاشة',
+    subtitle: 'تتبع كافة طلبات الجلسة واستعراض لقطات الحجز والأخطاء بدقة عالية',
   },
   settings: {
     title: 'إعدادات الاتصال والحساب الافتراضي',
@@ -42,14 +51,18 @@ export default function TopBar({
   onOpenMobileMenu,
   connectionState, // 'connected' | 'offline' | 'connecting'
   statusData,
+  radarStatus,
   lastUpdated,
   isRefreshing,
   onManualRefresh,
   onOpenSettings,
+  onOpenRadar,
   apiBaseUrl,
 }) {
   const meta = TAB_TITLES[activeTab] || TAB_TITLES.overview;
   const isBusy = Boolean(statusData?.busy);
+  const radarRunning = Boolean(radarStatus?.running);
+  const radarHasOpen = Boolean(radarStatus?.has_open_slots);
 
   return (
     <header className="sticky top-0 z-30 border-b border-slate-800/80 bg-slate-950/85 backdrop-blur-xl">
@@ -72,6 +85,23 @@ export default function TopBar({
 
         {/* Left side: Live status indicators */}
         <div className="flex items-center flex-wrap gap-2">
+          {/* Live Radar pill if running or open slots detected */}
+          {connectionState === 'connected' && (radarRunning || radarHasOpen) && (
+            <button
+              type="button"
+              onClick={onOpenRadar}
+              className={`inline-flex items-center gap-1.5 px-3 py-1.5 rounded-xl border text-xs font-extrabold transition-colors ${
+                radarHasOpen
+                  ? 'bg-emerald-500 text-slate-950 border-emerald-400 animate-pulse'
+                  : 'bg-emerald-500/15 border-emerald-500/35 text-emerald-300 hover:bg-emerald-500/25'
+              }`}
+              title="فتح رادار الروضة"
+            >
+              <Radar className="w-3.5 h-3.5" />
+              <span>{radarHasOpen ? 'مواعيد مفتوحة!' : `رادار (${radarStatus?.checks_count ?? 0})`}</span>
+            </button>
+          )}
+
           {/* Server connection badge */}
           <button
             type="button"

@@ -14,6 +14,7 @@ nusuk_state.json
 nusuk_state.json.tmp
 *.log
 fail_shots/
+booking_shots/
 
 # Python
 __pycache__/
